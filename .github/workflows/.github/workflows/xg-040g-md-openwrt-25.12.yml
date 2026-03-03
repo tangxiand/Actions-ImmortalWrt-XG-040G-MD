@@ -1,239 +1,206 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
 name: Build_XG_040G_MD_OpenWrt_25_12
 
-permissions:
-  contents: write
-  actions: write
-
 on:
+  repository_dispatch:
   workflow_dispatch:
     inputs:
-      log_switch:
-        description: "Build logs"
+      ssh:
+        description: 'SSH connection to Actions'
         required: false
-        default: false
+        default: 'false'
         type: boolean
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/xg-040g-md-openwrt-25.12.yml"
-      - "config/**"
-      - "scripts/**"
-      - "feeds.conf.default"
+  schedule:
+    - cron: 0 8 * * 1
 
 env:
-  CONFIG_FILE: "config/xg-040g-md.config"
   REPO_URL: https://github.com/xiangtailiang/openwrt.git
   REPO_BRANCH: openwrt-25.12
   FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: true
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
-  CCACHE_DIR: /mnt/openwrt/ccache
-  CCACHE_MAXSIZE: 5G
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+    - name: Checkout
+      uses: actions/checkout@main
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo apt-get remove -y '^dotnet-.*'
+        sudo apt-get remove -y '^llvm-.*'
+        sudo apt-get remove -y 'php.*'
+        sudo apt-get remove -y '^mongodb-.*'
+        sudo apt-get remove -y '^mysql-.*'
+        sudo apt-get remove -y azure-cli google-cloud-sdk google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        df -h
+        echo "Removing large directories"
+        sudo rm -rf /usr/share/dotnet/
+        sudo rm -rf /usr/local/graalvm/
+        sudo rm -rf /usr/local/.ghcup/
+        sudo rm -rf /usr/local/share/powershell
+        sudo rm -rf /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/local/lib/node_modules
+        df -h
+        sudo -E apt-get -qq update
+        sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+          g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+          libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5 \
+          libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lld llvm lrzsz mkisofs msmtp \
+          nano ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pip python3-ply \
+          python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig \
+          texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-      - name: Space usage check
-        run: df -h
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        tar zxvf $GITHUB_WORKSPACE/XG-040G-MD.tar.gz -C /workdir/openwrt
 
-      - name: Setup environment dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-          TZ: ${{ env.TZ }}
-        run: |
-          sudo apt update
-          sudo apt purge -y python3-distutils || true
-          sudo apt autoremove -y
-          sudo apt install -y \
-            build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-            python3-setuptools rsync swig unzip zlib1g-dev file wget \
-            mkbootimg device-tree-compiler ccache
-          if command -v mkbootimg >/dev/null 2>&1; then
-            echo "mkbootimg found at: $(command -v mkbootimg)"
-          else
-            echo "❌ mkbootimg not found in PATH!"
-          fi
+    - name: Enable build ccache
+      uses: klever1988/cachewrtbuild@main
+      with:
+        ccache: 'true'
+        mixkey: 'immortalwrt-xg040gmd-612'
+        prefix: ${{ github.workspace }}/openwrt
 
-          if [[ -n "$TZ" ]]; then
-            sudo timedatectl set-timezone "$TZ"
-          else
-            echo "TZ is not set, skipping timezone setup."
-          fi
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+   
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
 
-      - name: Ensure Python build tools
-        run: |
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install Unidecode
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
 
-      - name: Clone OpenWrt source code (openwrt-25.12)
-        run: |
-          git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
 
-      - name: Move build dirs to /mnt/openwrt
-        run: |
-          sudo mkdir -p /mnt/openwrt/{dl,staging_dir,build_dir,ccache}
-          sudo chown -R "$USER:$(id -gn)" /mnt/openwrt
-          rm -rf openwrt/dl openwrt/staging_dir openwrt/build_dir
-          ln -sfn /mnt/openwrt/dl openwrt/dl
-          ln -sfn /mnt/openwrt/staging_dir openwrt/staging_dir
-          ln -sfn /mnt/openwrt/build_dir openwrt/build_dir
-          df -h
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
-      - name: Restore dl cache
-        uses: actions/cache@v4
-        with:
-          path: /mnt/openwrt/dl
-          key: ${{ runner.os }}-openwrt-${{ env.REPO_BRANCH }}-dl-${{ hashFiles('feeds.conf.default') }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-${{ env.REPO_BRANCH }}-dl-
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
-        with:
-          path: /mnt/openwrt/ccache
-          key: ${{ runner.os }}-openwrt-${{ env.REPO_BRANCH }}-ccache-v2-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-${{ env.REPO_BRANCH }}-ccache-v2-
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
 
-      - name: Setup ccache
-        run: |
-          mkdir -p "$CCACHE_DIR"
-          ccache -M "$CCACHE_MAXSIZE"
-          echo "ccache dir: $CCACHE_DIR"
-          ccache -s
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
 
-      - name: Update & Install feeds
-        working-directory: ./openwrt
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a -f
-          wget -O feeds/packages/lang/rust/Makefile https://raw.githubusercontent.com/immortalwrt/packages/refs/heads/master/lang/rust/Makefile
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Install third-party packages (homeproxy, passwall)
-        working-directory: ./openwrt/package
-        run: |
-          chmod +x $GITHUB_WORKSPACE/scripts/update-packages.sh
-          bash $GITHUB_WORKSPACE/scripts/update-packages.sh
-          
-      - name: Copy configuration and defconfig
-        run: |
-          cp -fv "${CONFIG_FILE}" openwrt/.config
-          cd openwrt && make defconfig
-          [ -e .config ] && cp .config defconfig-final.config
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
 
-      - name: Upload build config files
-        uses: actions/upload-artifact@v6
-        with:
-          name: build-config
-          path: |
-            config/xg-040g-md.config
-            openwrt/defconfig-final.config
-            openwrt/feeds.conf.default
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=XG-040G-MD-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Download packages
-        working-directory: ./openwrt
-        run: |
-          make download -j4 V=s
-          # Remove small incomplete files <1KB
-          find dl -size -1024c -delete
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
 
-      - name: Compile OpenWrt firmware
-        id: compile
-        run: |
-          cd openwrt
-          echo "Disk usage before compile:"
-          df -h
-          if [[ "${{ inputs.log_switch }}" == "true" ]]; then
-            make -j1 V=s || {
-              echo "Compile failed, disk usage diagnostics:"
-              df -h
-              du -h -d1 . | sort -h | tail -n 30
-              exit 1
-            }
-          else
-            make -j$(nproc) || {
-              echo "Compile failed, disk usage diagnostics:"
-              df -h
-              du -h -d1 . | sort -h | tail -n 30
-              exit 1
-            }
-          fi
-          DEVICE_NAME=$(grep -o 'CONFIG_TARGET.*DEVICE_[^=]*=y' .config | head -1 | sed 's/.*DEVICE_\(.*\)=y/\1/')
-          if [[ -n "$DEVICE_NAME" ]]; then
-            echo "DEVICE_NAME=_${DEVICE_NAME}" >> "$GITHUB_ENV"
-          fi
-          echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
-          echo "status=success" >> $GITHUB_OUTPUT
-          echo "ccache stats (env CCACHE_DIR=$CCACHE_DIR):"
-          ccache -s || true
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
 
-      - name: Save ccache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: /mnt/openwrt/ccache
-          key: ${{ runner.os }}-openwrt-${{ env.REPO_BRANCH }}-ccache-v2-${{ github.run_id }}
-
-      - name: Prepare firmware artifacts path
-        id: organize
-        if: env.UPLOAD_FIRMWARE == 'true'
-        run: |
-          cd openwrt/bin/targets/*/*
-          rm -rf packages
-          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-
-      - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v6
-        if: env.UPLOAD_FIRMWARE == 'true'
-        with:
-          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-          path: ${{ env.FIRMWARE }}/*
-
-      - name: Generate release tag and notes
-        id: tag
-        if: env.UPLOAD_RELEASE == 'true'
-        run: |
-          echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-          cat <<EOF > release.txt
-          🚀 OpenWrt firmware for XG-040G-MD (openwrt-25.12)
-          ----------------------
-          设备型号: XG-040G-MD
-          构建时间: $(date +"%Y-%m-%d %H:%M")
-          内核版本: 6.12.X
-          源码仓库: $REPO_URL
-          分支: $REPO_BRANCH
-          EOF
-
-      - name: Publish GitHub Release
-        uses: ncipollo/release-action@v1
-        if: env.UPLOAD_RELEASE == 'true'
-        with:
-          tag: ${{ steps.tag.outputs.release_tag }}
-          bodyFile: release.txt
-          artifacts: |
-            ${{ env.FIRMWARE }}/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cleanup workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          retain_days: 7
-          keep_minimum_runs: 5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.2.1
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
