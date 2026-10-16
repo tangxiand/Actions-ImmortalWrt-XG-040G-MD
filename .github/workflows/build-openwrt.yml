@@ -64,7 +64,7 @@ jobs:
         sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
           bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
           g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
-          libglib2.0-dev liblzo2-dev libncurses-dev libopenssl-dev libpython3-dev libreadline-dev libssl-dev \
+          libglib2.0-dev liblzo2-dev libncurses-dev libssl-dev libpython3-dev libreadline-dev libssl-dev \
           libtool python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
           upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
         sudo -E apt-get -qq autoremove --purge
