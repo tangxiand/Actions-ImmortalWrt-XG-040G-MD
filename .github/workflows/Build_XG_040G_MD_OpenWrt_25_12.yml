@@ -23,8 +23,8 @@ on:
     - cron: 0 8 * * 1
 
 env:
-  REPO_URL: https://github.com/xiangtailiang/openwrt.git
-  REPO_BRANCH: openwrt-25.12
+  REPO_URL: https://github.com/pbs05/ponwrt.git
+  REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
