@@ -43,6 +43,20 @@ your-repo/
 1. 用 [AN758x-Stock2UBI](https://github.com/pbs05/an758x-stock2ubi) 备份原厂并刷入 UBI 布局，U-Boot 用 [AN758x U-Boot](https://github.com/pbs05/uboot-an758x)。
 2. 刷完 PonWrt 后，在 LuCI **网络 → PON → 配置 → PON board data** 恢复诺基亚的 `bosa`、`ri` 两个卷（来自原厂备份），否则 PON 口不会注册上线。
 
+## 常见问题：`固件内缺少 PON 组件： fitblk`
+
+**现象**：Job 跑了 1 个多小时，最后红在"固件内缺少 PON 组件： fitblk"，Artifacts 为空。
+
+**原因**：`fitblk` 是 `package/utils/fitblk` 里的 **`HIDDEN:=1` 隐藏基础包**（依赖 `fit-check-sign`），只作为设备默认包被拉进来，不进菜单；它负责"释放 uImage.FIT 块设备"，**不属于 PON 功能**。部分 apk 构建写出的 `.manifest` 不列隐藏包，于是校验误判。真正决定 PON 的是 `kmod-airoha-xpon`、`kmod-airoha-en7572`、`airoha-ponctl`、`airoha-pond` 这 4 个。
+
+**已修**（build.yml 更新版）：
+- 硬校验只针对上述 4 个 PON 核心包；`fitblk` 降级为 `::warning::`，不再判失败；
+- manifest 只取本设备那份（`*nokia_xg-040g-md-ubi*`），不再随手抓第一个；
+- 新增 `pon-report` 产物，把 manifest 里 `pon/airoha/fit` 相关行、`targets/packages` 里相关包全打出来；
+- 所有 Artifacts 上传改成 `always()`，即使后面某步报错，1 小时的镜像也不会再被丢掉。
+
+**想确认设备上是否真有 fitblk**：刷机后 SSH 执行 `ls -l /usr/sbin/fitblk`，或 `apk list --installed | grep fitblk`。
+
 ## 关于 iStore 的兼容性说明
 
 PonWrt 这棵源码基于 ImmortalWrt master、默认用 **apk** 包管理器。iStore 官方已支持 apk，但其 `quickstart`/`luci-app-store` 在某些组合下可能依赖缺失而**被 defconfig 静默丢弃**（表现为 `[MISS] luci-app-store`，不会让编译失败）。若你发现 iStore 没出来：
