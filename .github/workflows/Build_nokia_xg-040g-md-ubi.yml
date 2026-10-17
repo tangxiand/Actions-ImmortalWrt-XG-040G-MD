@@ -5,7 +5,7 @@
 # See /LICENSE for more information.
 #
 # Modified for PonWrt Nokia XG-040G-MD (AN7581)
-# 修复：EVB默认设备覆盖、profiles.json报错、内存溢出、编译收尾报错
+# 修复：silentoldconfig依赖报错、swapfile权限错误、EVB默认设备覆盖、profiles.json报错
 #
 name: Build_nokia_xg-040g-md-ubi
 on:
@@ -110,8 +110,8 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
         
-        # 【关键】只补全缺失依赖，绝不重置设备选型（替代原来的 make defconfig）
-        make silentoldconfig
+        # 用olddefconfig替代silentoldconfig，自动解决依赖缺失，不重置设备
+        make olddefconfig
         
         # 编译前校验：打印当前选中的设备，提前确认不是EVB
         echo "==================== 当前编译目标设备 ===================="
