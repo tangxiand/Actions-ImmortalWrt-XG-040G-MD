@@ -8,6 +8,9 @@ src-git pon_drivers https://github.com/pbs05/openwrt-pon-drivers.git
 src-git pon_userspace https://github.com/pbs05/openwrt-pon-userspace.git
 # iStore 应用商店（集成到 LuCI）
 src-git istore https://github.com/istoreos/istore.git;main
+# socat 的 LuCI 界面（官方 feeds 没有此包，用第三方源）
+# 依赖：+socat +luci +luci-compat；不需要就注释掉这一行，并删 my.config 里的 luci-app-socat 两行
+src-git socatapp https://github.com/chenmozhijin/luci-app-socat.git;main
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
 #src-link custom /usr/src/openwrt/custom-feed
