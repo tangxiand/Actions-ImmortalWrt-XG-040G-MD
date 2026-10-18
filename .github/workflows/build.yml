@@ -118,14 +118,13 @@ jobs:
             exit 1
           fi
         done
-        # 确认 socat 的包真的被 feeds 索引到了，早发现早报错
-        for p in luci-app-socat; do
-          if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
-            echo "  [ OK ] 已索引 $p"
-          else
-            echo "::warning::feeds 里找不到 $p（socatapp 源未成功拉取？）"
-          fi
-        done
+        # socat 图形界面改由 diy-part1.sh 直接克隆进 package/（不再走 feeds 索引），
+        # 这里确认它真的就位，早发现早告警
+        if [ -f package/luci-app-socat/Makefile ]; then
+          echo "  [ OK ] package/luci-app-socat/Makefile 已就位（diy-part1.sh 克隆成功）"
+        else
+          echo "::warning::package/luci-app-socat/Makefile 不存在（diy-part1.sh 未成功克隆？）"
+        fi
 
     - name: 配置：官方基线 → 裁剪单设备 → 叠加差异项 → 断言设备与关键包
       run: |
@@ -170,7 +169,7 @@ jobs:
         # ---------- 2) 关键包（缺了固件就白编）----------
         for p in airoha-pond airoha-ponctl kmod-airoha-xpon kmod-airoha-en7572 \
                  px5g-mbedtls luci-app-ddns \
-                 openvpn-openssl luci-app-openvpn; do
+                 openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server; do
           if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
             echo "  [ OK ]   关键包 $p"
           else
@@ -194,8 +193,8 @@ jobs:
             fi
           done
           echo "::endgroup::"
-          if [ "${REQUIRE_OPTIONAL}" = "true" ]; then
-            echo "::error::socat 图形界面未生效:$OPT_MISS（把 build.yml 里 REQUIRE_OPTIONAL 改成 false 可跳过；或检查 feeds.conf.default 的 socatapp 源）"
+            if [ "${REQUIRE_OPTIONAL}" = "true" ]; then
+            echo "::error::socat 图形界面未生效:$OPT_MISS（把 build.yml 里 REQUIRE_OPTIONAL 改成 false 可跳过；或检查 diy-part1.sh 是否成功克隆 luci-app-socat）"
             fail=1
           else
             echo "::warning::socat 图形界面未生效:$OPT_MISS（继续编译）"
@@ -210,7 +209,7 @@ jobs:
                  luci-app-iptv zerotier luci-app-zerotier luci-app-wol \
                  ddns-go luci-app-ddns-go luci-app-ddns ddns-scripts \
                  socat luci-app-socat px5g-mbedtls \
-                 openvpn-openssl luci-app-openvpn kmod-tun \
+                 openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server kmod-tun \
                  luci-theme-argon kmod-usb-storage kmod-fs-ext4 \
                  luci-app-filebrowser \
                  luci-app-package-manager ca-bundle; do
@@ -305,7 +304,7 @@ jobs:
         # 软校验：本次新增/确认的组件是否真进了镜像（只告警，不判失败）
         if [ -n "$M" ]; then
           for p in px5g-mbedtls luci-app-ddns ddns-scripts socat \
-                   luci-app-socat openvpn-openssl luci-app-openvpn kmod-tun \
+                   luci-app-socat openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server kmod-tun \
                    ca-bundle luci-app-package-manager; do
             if grep -qE "^${p}([[:space:]]|-)" "$M"; then
               echo "  [进包] $p"
