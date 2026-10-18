@@ -24,6 +24,9 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   DEVICE_SYM: CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_nokia_xg-040g-md-ubi
+  # socat 图形界面属"可选集成"：true=没生效就 fail（约 10 分钟内出结果，省得白跑 2.5h）；
+  # 改成 false = 只告警、继续出固件。第三方 socat 源出问题时把它设为 false。
+  REQUIRE_OPTIONAL: 'true'
 
 jobs:
   build:
@@ -88,20 +91,43 @@ jobs:
         [ -f "$GITHUB_WORKSPACE/$DIY_P1_SH" ] && $GITHUB_WORKSPACE/$DIY_P1_SH || true
 
     - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+      run: |
+        cd openwrt
+        if ! ./scripts/feeds update -a; then
+          echo "::warning::feeds update -a 失败，改为逐源更新（单个可选源失败不致命）"
+          while read -r kind name _ <&3; do
+            case "$kind" in
+              src-git|src-git-full|src-svn|src-link) ;;
+              *) continue ;;
+            esac
+            echo "--- 更新源: $name ---"
+            ./scripts/feeds update "$name" || echo "::warning::源 $name 更新失败，跳过"
+          done 3< feeds.conf.default
+        fi
 
     - name: Install feeds
       run: |
         cd openwrt
-        ./scripts/feeds install -a
+        ./scripts/feeds install -a || {
+          echo "::warning::feeds install -a 未完全成功，重试一次"
+          ./scripts/feeds install -a || true
+        }
         for f in pon_drivers pon_userspace; do
           if [ ! -d "feeds/$f" ]; then
             echo "::error::feeds/$f 不存在，feeds.conf.default 必须包含该源"
             exit 1
           fi
         done
+        # 确认 socat 的包真的被 feeds 索引到了，早发现早报错
+        for p in luci-app-socat; do
+          if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then
+            echo "  [ OK ] 已索引 $p"
+          else
+            echo "::warning::feeds 里找不到 $p（socatapp 源未成功拉取？）"
+          fi
+        done
 
-    - name: 配置：官方基线 → 裁剪单设备 → 叠加差异项 → 断言设备与 PON
+    - name: 配置：官方基线 → 裁剪单设备 → 叠加差异项 → 断言设备与关键包
       run: |
         cd openwrt
 
@@ -132,28 +158,62 @@ jobs:
 
         make defconfig
 
+        fail=0
+
+        # ---------- 1) 设备符号 ----------
         if ! grep -q "^${DEVICE_SYM}=y" .config; then
           echo "::error::设备符号 ${DEVICE_SYM} 未生效，会回落 EVB"
           grep -E '^CONFIG_TARGET_DEVICE_.*=y' .config || true
-          exit 1
+          fail=1
         fi
 
-        # 只对真正决定 PON 功能的 4 个包做硬校验（fitblk 是 HIDDEN 基础包，不在此列）
-        MISS=""
-        for p in airoha-pond airoha-ponctl kmod-airoha-xpon kmod-airoha-en7572; do
-          grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config || MISS="$MISS $p"
+        # ---------- 2) 关键包（缺了固件就白编）----------
+        for p in airoha-pond airoha-ponctl kmod-airoha-xpon kmod-airoha-en7572 \
+                 px5g-mbedtls luci-app-ddns \
+                 openvpn-openssl luci-app-openvpn; do
+          if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
+            echo "  [ OK ]   关键包 $p"
+          else
+            echo "::error::关键包 $p 未生效（符号不存在或依赖未满足）"
+            fail=1
+          fi
         done
-        if [ -n "$MISS" ]; then
-          echo "::error::PON 组件未生效:$MISS（检查 pon_drivers/pon_userspace feeds）"
-          exit 1
+
+        # ---------- 3) socat 图形界面（第三方源，依赖 luci-compat 等）----------
+        OPT_MISS=""
+        for p in luci-app-socat; do
+          grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config || OPT_MISS="$OPT_MISS $p"
+        done
+        if [ -n "$OPT_MISS" ]; then
+          echo "::group::socat 图形界面依赖诊断"
+          for p in luci-app-socat socat luci-compat luci-lua-runtime uhttpd-mod-lua; do
+            if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
+              echo "  [ OK ] $p"
+            else
+              echo "  [MISS] $p"
+            fi
+          done
+          echo "::endgroup::"
+          if [ "${REQUIRE_OPTIONAL}" = "true" ]; then
+            echo "::error::socat 图形界面未生效:$OPT_MISS（把 build.yml 里 REQUIRE_OPTIONAL 改成 false 可跳过；或检查 feeds.conf.default 的 socatapp 源）"
+            fail=1
+          else
+            echo "::warning::socat 图形界面未生效:$OPT_MISS（继续编译）"
+          fi
         fi
 
         echo "==================== 目标设备 ===================="
         grep -E '^CONFIG_TARGET_(MULTI_PROFILE|DEVICE)' .config || true
-        echo "==================== 可选功能解析情况 ===================="
-        for p in luci-app-pon luci-i18n-pon-zh-cn airoha-pon-debug luci-app-iptv zerotier \
-                 luci-app-zerotier luci-app-wol ddns-go luci-app-ddns-go socat \
-                 luci-theme-argon kmod-usb-storage kmod-fs-ext4 luci-app-store luci-app-filebrowser; do
+
+        echo "==================== 功能解析情况 ===================="
+        for p in luci-app-pon luci-i18n-pon-zh-cn airoha-pon-debug \
+                 luci-app-iptv zerotier luci-app-zerotier luci-app-wol \
+                 ddns-go luci-app-ddns-go luci-app-ddns ddns-scripts \
+                 socat luci-app-socat px5g-mbedtls \
+                 openvpn-openssl luci-app-openvpn kmod-tun \
+                 luci-theme-argon kmod-usb-storage kmod-fs-ext4 \
+                 luci-app-filebrowser \
+                 luci-app-package-manager ca-bundle; do
           if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
             echo "  [ OK ]   $p"
           else
@@ -161,6 +221,12 @@ jobs:
           fi
         done
         echo "===================================================="
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::配置阶段断言未通过，提前终止（省掉 2 小时空编译）"
+          exit 1
+        fi
+        echo "配置阶段断言全部通过"
 
     - name: SSH connection to Actions
       uses: P3TERX/ssh2actions@v1.0.0
@@ -208,6 +274,8 @@ jobs:
           if [ -n "$M" ]; then
             echo "--- pon / airoha / fit 相关行 ---"
             grep -inE 'fitblk|fit-check|pon|airoha' "$M" || echo "(无匹配行)"
+            echo "--- ddns / socat / px5g / store / taskd 相关行 ---"
+            grep -inE 'ddns|socat|px5g|store|taskd|ca-bundle|ca-certificates' "$M" || echo "(无匹配行)"
           fi
           echo
           echo "--- targets/packages 里 pon / fit 相关包 ---"
@@ -232,6 +300,19 @@ jobs:
           fi
         else
           echo "::warning::没有 .manifest，跳过 PON 校验（镜像已生成，照常上传）"
+        fi
+
+        # 软校验：本次新增/确认的组件是否真进了镜像（只告警，不判失败）
+        if [ -n "$M" ]; then
+          for p in px5g-mbedtls luci-app-ddns ddns-scripts socat \
+                   luci-app-socat openvpn-openssl luci-app-openvpn kmod-tun \
+                   ca-bundle luci-app-package-manager; do
+            if grep -qE "^${p}([[:space:]]|-)" "$M"; then
+              echo "  [进包] $p"
+            else
+              echo "::warning::manifest 未见 $p（配置阶段若为 OK，多半是版本号行格式不同，可用 pon-report 复核）"
+            fi
+          done
         fi
 
         echo "PON 核心组件校验通过"
