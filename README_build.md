@@ -1,14 +1,15 @@
 # PonWrt · Nokia XG-040G-MD (UBI) 一键云编译仓库
 
-本目录是**完整的 GitHub Actions 仓库内容**，commit 到你的 GitHub 仓库后，在 Actions 页面点一次 "Run workflow" 即可编译出带 PON 功能、并集成 iStore 的固件。
+本目录是**完整的 GitHub Actions 仓库内容**，commit 到你的 GitHub 仓库后，在 Actions 页面点一次 "Run workflow" 即可编译出带 PON 功能、并集成 socat 图形界面 / 动态 DNS / OpenVPN / px5g-mbedtls 的固件。
 
 ## 目录结构（保持原样提交到仓库根目录）
 
 ```
 your-repo/
-├── .github/workflows/build.yml   # 编译工作流（已含 PON 断言 + iStore 集成）
-├── feeds.conf.default            # feeds 源：pon_drivers / pon_userspace / istore
-└── my.config                     # 你的功能差异项（device + PON + iStore + 常用 App）
+├── .github/workflows/build.yml   # 编译工作流（已含 PON 断言 + OpenVPN/socat/DDNS 集成）
+├── feeds.conf.default            # feeds 源：pon_drivers / pon_userspace / istore（socat 不再走此文件）
+├── diy-part1.sh                  # 预处理脚本：把第三方 luci-app-socat 克隆进 package/
+└── my.config                     # 你的功能差异项（device + PON + OpenVPN + socat + DDNS + 常用 App）
 ```
 
 > 注意：根目录**不要**再放旧的 `.config`（旧的整份 .config 会与官方基线冲突）。本方案用 `configs/an7581.config` 作基线，只把 `my.config` 作为差异项叠加。
@@ -31,9 +32,9 @@ your-repo/
 - `PON 核心组件校验通过` → 编译结束后**必须**出现
 
 可选功能解析情况里：
-- `[ OK ] luci-app-store` → iStore 已编进固件
-- `[MISS] luci-app-store` → 依赖链断了，同一段日志里会打印 iStore 依赖链明细
-- `[ OK ] luci-app-socat` → socat 的 LuCI 界面已进包
+- `[ OK ] luci-app-socat` → socat 的 LuCI 界面已进包（由 diy-part1.sh 克隆进 package/，配置阶段的断言会校验）
+- `[ OK ] luci-app-openvpn-server` → OpenVPN 的 LuCI 界面已进包（注意不是 luci-app-openvpn，immortalwrt 已无此包）
+- `[ OK ] px5g-mbedtls` / `[ OK ] luci-app-ddns` → 已进包
 
 ## 产物位置
 
@@ -53,23 +54,24 @@ your-repo/
 |---|---|---|---|
 | `ddns-go`（DDNS-Go） | **其实已进固件** | — | 保持（服务 → DDNS-Go 可见） |
 | 经典「动态 DNS」 | 缺失 | `my.config` 里只钉了 `ddns-scripts`，**漏了 `luci-app-ddns`**（菜单项来自它） | 已补 `luci-app-ddns` + `luci-i18n-ddns-zh-cn` + `ddns-scripts-cloudflare/aliyun` |
-| `socat`（**要图形界面**） | 只有命令行、无界面 | 官方 feeds **没有** `luci-app-socat`，socat 本身是纯 CLI | 新增第三方源 `socatapp` + `luci-app-socat`（服务 → Socat），并钉住 Lua 运行前提 `luci-compat / luci-lua-runtime / uhttpd-mod-lua` |
-| `OpenVPN` | 缺失 | 没选 | 新增 `openvpn-openssl` + `luci-app-openvpn` + `luci-i18n-openvpn-zh-cn` + `kmod-tun` |
+| `socat`（**要图形界面**） | 只有命令行、无界面 | 官方 feeds **没有** `luci-app-socat`，socat 本身是纯 CLI | 新增 `diy-part1.sh` 把第三方 `luci-app-socat` 直接克隆进 `package/`（服务 → Socat），并钉住 Lua 运行前提 `luci-compat / luci-lua-runtime / uhttpd-mod-lua` |
+| `OpenVPN` | 缺失 | 没选 | 新增 `openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`（注意：immortalwrt 已无 `luci-app-openvpn`）+ `luci-i18n-openvpn-server-zh-cn` + `kmod-tun` |
 | `px5g-mbedtls` | 未选 | 基线 `configs/an7581.config` 里根本没有 px5g；`uhttpd` 也不再依赖它（DEPENDS 只有 libubox/blobmsg/json 等） | 显式 `CONFIG_PACKAGE_px5g-mbedtls=y`，并关掉 `px5g-wolfssl` / `px5g-openssl` |
 
 > **px5g 为什么要关另外两个**：`px5g-mbedtls`、`px5g-wolfssl`、`px5g-openssl` 都 `PROVIDES:=px5g`，且都要安装 `/usr/sbin/px5g`。同时选中会**文件冲突**，镜像打包阶段直接报错。三者只能留一个，这里留 mbedtls 实现（与 `libmbedtls` 复用，体积更省）。
 
-> **socat 界面是第三方包**（`chenmozhijin/luci-app-socat`，`LUCI_DEPENDS:=+socat +luci +luci-compat`）。若该源拉取失败导致整次构建失败：把 `feeds.conf.default` 里 `src-git socatapp ...` 注释掉，并删 `my.config` 里 `luci-app-socat`、`luci-i18n-socat-zh-cn` 两行即可，其它功能不受影响。
+> **socat 界面是第三方包**（`chenmozhijin/luci-app-socat`，`LUCI_DEPENDS:=+socat +luci +luci-compat`，Makefile 用 `include $(TOPDIR)/feeds/luci/luci.mk`，放进 `package/` 也能正确编译）。若克隆失败导致整次构建失败：把 `diy-part1.sh` 里 socat 克隆段注释掉，并删 `my.config` 里 `luci-app-socat`、`luci-i18n-socat-zh-cn` 两行即可，其它功能不受影响。（`feeds.conf.default` 里的 `src-git socatapp` 已默认注释掉，无需再动。）
 
 > **socat 图形界面能否显示的前提**：它是 Lua 控制器，必须在 ucode/JS 为主的 LuCI 上挂上 Lua 运行层。本版已钉 `luci-compat`、`luci-lua-runtime`、`uhttpd-mod-lua`。若刷机后「服务 → Socat」菜单不出现，通常是 LuCI 的 Lua 层问题（非编译失败），把日志发我。
 
 ### 断言提前了，不会再白等 2.5 小时
 
-`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl`、`luci-app-openvpn`，以及 `luci-app-socat`。缺任何一个直接 `::error::` 终止，并打印 socat 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
+`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`，以及 `luci-app-socat`（来自 `package/`，非 feeds）。缺任何一个直接 `::error::` 终止，并打印 socat 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
 
-`luci-app-store` / `luci-app-socat` 属"可选集成"，由 `build.yml` 顶部 `REQUIRE_OPTIONAL` 控制：
+`luci-app-socat` 属"可选集成"，由 `build.yml` 顶部 `REQUIRE_OPTIONAL` 控制：
 - `'true'`（默认）：没生效就失败，快速暴露问题；
 - `'false'`：只告警、继续出固件。
+（iStore 已按你的要求移除，不再参与断言。）
 
 ## 在线安装软件包（apk 源，无需重新编译）
 
@@ -108,9 +110,9 @@ apk search luci-app-ttyd | head
 ## 关于 socat 图形界面 / OpenVPN 的说明
 
 - **socat 图形界面**：`luci-app-socat` 是第三方 Lua 包。在 ucode/JS 为主的 LuCI 上要让 Lua 控制器跑起来，必须有 `luci-compat` + `luci-lua-runtime` + `uhttpd-mod-lua`，本版已钉住。若刷机后「服务 → Socat」不显示，是 LuCI 的 Lua 运行层问题（不是编译失败），把日志发我即可。
-- **OpenVPN**：用 `openvpn-openssl` 实现，复用固件里已选的 `libopenssl`（与 `apk-openssl` 同源），省体积；`kmod-tun` 提供 tun 内核模块；`luci-app-openvpn` 提供「服务 → OpenVPN」配置界面。
+- **OpenVPN**：用 `openvpn-openssl` 实现，复用固件里的 `libopenssl`（与 `apk-openssl` 同源），省体积；`openvpn-easy-rsa` 提供证书工具；`kmod-tun` 提供 tun 内核模块；**真实包名是 `luci-app-openvpn-server`**（immortalwrt master 已没有 `luci-app-openvpn`），提供「服务 → OpenVPN Server」配置界面。
 
-iStore 已按你的要求**移除**，相关依赖链不再需要。若日后想加回，按本文件旧版说明重建依赖链即可。
+iStore 已按你的要求**移除**，相关依赖链不再需要，本固件也不再追求 iStore。
 
 ## 想让我以后直接帮你触发编译？
 
