@@ -6,8 +6,10 @@ src-git telephony https://github.com/openwrt/telephony.git
 src-git video https://github.com/openwrt/video.git
 src-git pon_drivers https://github.com/pbs05/openwrt-pon-drivers.git
 src-git pon_userspace https://github.com/pbs05/openwrt-pon-userspace.git
-# iStore 应用商店（集成到 LuCI）
-# 注意：本工作流已按用户要求移除 iStore（依赖链长、易静默丢弃整包）
+# iStore 应用商店（集成到 LuCI，菜单「服务 → iStore」，包名 luci-app-store）
+# 用户 2026-11-07 要求重新集成；PKG_VERSION=0.2.1-r1，与用户现有固件一致。
+# 依赖 curl/tar/libuci-lua/mount-utils + luci-lib-taskd(→luci-lib-xterm,taskd)，均自动拉取；
+# 另需 luci-compat（本配置已含）。apk 体系已支持（Makefile 含 USE_APK）。
 src-git istore https://github.com/istoreos/istore.git;main
 # socat 的 LuCI 界面（官方 feeds 没有此包）改由 diy-part1.sh 直接克隆进 package/，
 # 不再用 src-git 第三方源——上一轮 CI 里该源未被 feeds 索引到（日志 "feeds 里找不到 luci-app-socat"）。
