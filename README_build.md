@@ -6,10 +6,11 @@
 
 ```
 your-repo/
-├── .github/workflows/build.yml   # 编译工作流（已含 PON 断言 + OpenVPN/socat/DDNS 集成）
+├── .github/workflows/build.yml   # 编译工作流（已含 PON 断言 + OpenVPN/socat/DDNS/NPU/DoH 集成）
 ├── feeds.conf.default            # feeds 源：pon_drivers / pon_userspace / istore（socat 不再走此文件）
-├── diy-part1.sh                  # 预处理脚本：把第三方 luci-app-socat 克隆进 package/
-└── my.config                     # 你的功能差异项（device + PON + OpenVPN + socat + DDNS + 常用 App）
+├── diy-part1.sh                  # 预处理脚本：把第三方 luci-app-socat 与 luci-app-airoha-npu 克隆进 package/
+├── diy-part2.sh                  # 首次启动默认配置：打开 NPU 硬件流卸载
+└── my.config                     # 你的功能差异项（device + PON + OpenVPN + socat + DDNS + NPU + DoH + 常用 App）
 ```
 
 > 注意：根目录**不要**再放旧的 `.config`（旧的整份 .config 会与官方基线冲突）。本方案用 `configs/an7581.config` 作基线，只把 `my.config` 作为差异项叠加。
@@ -48,7 +49,7 @@ your-repo/
 
 ## 本次补齐的功能（socat 图形界面 / 动态 DNS / OpenVPN / px5g-mbedtls）
 
-上一版编译成功（约 2.5 小时），但这几项没进固件。iStore 已按要求**移除**，其余补齐：
+上一版编译成功（约 2.5 小时），但这几项没进固件；iStore 当时按要求移除，本次已按你 2026-11-07 的要求重新集成（见下方「iStore 应用商店」）。其余补齐：
 
 | 功能 | 上一版状态 | 原因 | 本次处理 |
 |---|---|---|---|
@@ -66,12 +67,12 @@ your-repo/
 
 ### 断言提前了，不会再白等 2.5 小时
 
-`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`，以及 `luci-app-socat`（来自 `package/`，非 feeds）。缺任何一个直接 `::error::` 终止，并打印 socat 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
+`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`、以及 `luci-app-socat`（来自 `package/`，非 feeds）、`airoha-en7581-npu-firmware` + `kmod-nft-offload`、`https-dns-proxy` + `luci-app-https-dns-proxy`、`luci-app-store`（iStore，来自 istore 源）。缺任何一个直接 `::error::` 终止，并打印 socat/iStore 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
 
 `luci-app-socat` 属"可选集成"，由 `build.yml` 顶部 `REQUIRE_OPTIONAL` 控制：
 - `'true'`（默认）：没生效就失败，快速暴露问题；
 - `'false'`：只告警、继续出固件。
-（iStore 已按你的要求移除，不再参与断言。）
+（`luci-app-store` / iStore 现已重新集成并参与配置阶段硬断言，源加载失败会在 10 分钟内红掉。）
 
 ## 在线安装软件包（apk 源，无需重新编译）
 
@@ -112,7 +113,38 @@ apk search luci-app-ttyd | head
 - **socat 图形界面**：`luci-app-socat` 是第三方 Lua 包。在 ucode/JS 为主的 LuCI 上要让 Lua 控制器跑起来，必须有 `luci-compat` + `luci-lua-runtime` + `uhttpd-mod-lua`，本版已钉住。若刷机后「服务 → Socat」不显示，是 LuCI 的 Lua 运行层问题（不是编译失败），把日志发我即可。
 - **OpenVPN**：用 `openvpn-openssl` 实现，复用固件里的 `libopenssl`（与 `apk-openssl` 同源），省体积；`openvpn-easy-rsa` 提供证书工具；`kmod-tun` 提供 tun 内核模块；**真实包名是 `luci-app-openvpn-server`**（immortalwrt master 已没有 `luci-app-openvpn`），提供「服务 → OpenVPN Server」配置界面。
 
-iStore 已按你的要求**移除**，相关依赖链不再需要，本固件也不再追求 iStore。
+### iStore 应用商店（服务 → iStore，包名 luci-app-store）
+
+按你 2026-11-07 的要求重新集成（之前按要求移除过）。菜单里叫「iStore」，版本 `0.2.1-r1`，与你现有固件一致。
+
+- **来源**：`feeds.conf.default` 里的 `src-git istore https://github.com/istoreos/istore.git;main`（iStoreOS 官方源）。只需选 `luci-app-store`，它的 `LUCI_DEPENDS` 自动拉 `curl` / `tar` / `libuci-lua` / `mount-utils` / `luci-lib-taskd`；`luci-lib-taskd` 再拉 `luci-lib-xterm` + `taskd`（后端守护进程）。`luci-compat` 本配置已含（19.07+ 必需）。
+- **apk 支持**：该包 Makefile 含 `USE_APK`，对 apk 体系做了适配，可在本固件的 apk 上正常安装/卸载插件。
+- **编译注意**：构建时会从 GitHub 下载 `istore-ui` 前端 tarball（linkease/istore-ui），所以 `make download` 阶段需联网；若 download 失败会红在下载环节。
+- **配置阶段硬断言**：`build.yml` 现已把 `luci-app-store` 纳入配置阶段硬断言——istore 源没加载成功、或包被静默丢弃，会在 10 分钟内 `::error::` 终止（不再像以前那样「静默丢整包」）。
+- **刷机后验证**：LuCI **服务 → iStore** 可见；首次打开会拉取应用列表。若列表为空/打不开，通常是设备到 iStoreOS 软件源的联网问题，与编译无关。
+
+## 本轮新增：NPU 硬件加速 + HTTPS DNS 代理（DoH）
+
+- **NPU / 硬件流卸载**：AN7581 内置 PPE（Packet Processor Engine）+ NPU（RISC-V）做硬件快转。内核驱动 `airoha_eth` 与 NPU 固件 `airoha-en7581-npu-firmware` 已显式钉进 `my.config`；另加 `kmod-nft-offload` 提供 nftables 流卸载路径。固件**首次启动即自动打开** `firewall` 的 `flow_offloading` 与 `flow_offloading_hw`（`diy-part2.sh` 写入的 uci-defaults 完成），无需手动开。
+  - 验证：LuCI **状态 → 防火墙** 看 "Flow Offloading / Hardware Flow Offloading" 已勾选；或 `logread | grep -i ppe` / `nft list flowtables`。
+- **NPU 状态监控页（肉眼确认加速）**：上游 `immortalwrt/luci` 没有 `luci-app-airoha-npu`，但社区仓库 [`luanmuc/luci-app-airoha-npu`](https://github.com/luanmuc/luci-app-airoha-npu)（v1.2.1，与你截图里那台"支持硬件加速"的固件**同源同版**）提供它。我们已把它**直接克隆进 `package/`**（`diy-part1.sh` 完成，仓库根即包本体），并钉入 `luci-app-airoha-npu` + `luci-i18n-airoha-npu-zh-cn`。
+  - 它**只做监控/CPU 频率/PPE 流表展示**，**不负责开启硬件加速**（加速由上面的 NPU 固件 + `diy-part2.sh` 的 `flow_offloading_hw` 负责）——装这个页面纯粹是为了让你能在 LuCI 里**肉眼看见 NPU/PPE 在工作**。
+  - LuCI 路径：**状态 → Airoha SoC Status (NPU, CPU, Frame Engine)**。可见 NPU 固件版本/负载、PPE 流表绑定数、各 GDM 端口 TX/RX 计数、CDM 硬件转发占比等。
+  - 运行前提是 busybox 的 `devmem`（Frame Engine 寄存器访问 + CPU 超频用）。本版已在 `my.config` 设 `CONFIG_BUSYBOX_CUSTOM=y` + `CONFIG_BUSYBOX_CONFIG_DEVMEM=y` + `CONFIG_KERNEL_DEVMEM=y`，满足其 `devmem` 依赖。
+  - 注意：该页面读取 `/sys/kernel/debug/ppe/entries` 等 debugfs，需内核开了 debugfs（OpenWrt 默认挂载），无需额外配置。
+
+### 概览页的 CPU / PON 温度（状态 → 概览）
+
+你截图里看到的 `温度: CPU: xx°C | PON: xx°C` 是 **LuCI 概览页**自带的，由 `luci-mod-status` 从内核热区 `/sys/class/thermal/thermal_zone*` 自动渲染，**不用任何 LuCI 设置、也不是 `luci-app-airoha-npu` 提供的**。
+
+- **CPU 温度**：靠 Airoha EN7581 片上热传感器驱动 `CONFIG_AIROHA_THERMAL`（内核 6.16+ 引入，本编译已钉 `=y`，并带 `CONFIG_THERMAL=y`）。这是显式符号，不钉可能因基线没开而缺 CPU 热区。
+- **PON 温度**：来自 PonWrt 的 airoha PON/光模块驱动 + XG-040G-MD 设备树热区；本编译已含 `kmod-airoha-xpon` / `kmod-airoha-en7572` / `kmod-airoha-paged-bosa` / `airoha-ponctl`，会随设备树自动出现。
+- **刷机后自测**：SSH 进路由器执行 `cat /sys/class/thermal/thermal_zone*/type` 与 `cat /sys/class/thermal/thermal_zone*/temp`（temp 单位是千分之一摄氏度，如 `62800` = 62.8°C），确认有 `cpu` / `pon` 之类的热区；有了概览页就会显示。
+- 若概览页只显示 CPU、没有 PON：通常是该批次光模块/设备树没暴露 PON 热区（PON 驱动层面），与编译开关无关，不影响功能。
+- **HTTPS DNS 代理（DoH）**：集成 `https-dns-proxy` + `luci-app-https-dns-proxy`。默认用 Google/Cloudflare 的 DoH，并自动接管 dnsmasq 的上游，实现 DNS 加密防劫持。LuCI 路径：**服务 → HTTPS DNS Proxy**。依赖的 `ca-bundle` 已在本文件上方的"在线安装能力"段配置。
+  - 想换 DoH 提供商（如 AdGuard、Quad9、阿里/腾讯）：在 **服务 → HTTPS DNS Proxy** 里改 `resolver_url` 即可。
+
+本次 `my.config` 新增关键符号：`airoha-en7581-npu-firmware`、`kmod-nft-offload`、`luci-app-airoha-npu`、`luci-i18n-airoha-npu-zh-cn`、`https-dns-proxy`、`luci-app-https-dns-proxy`。
 
 ## 想让我以后直接帮你触发编译？
 
