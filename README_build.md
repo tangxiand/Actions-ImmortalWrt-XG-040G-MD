@@ -67,12 +67,16 @@ your-repo/
 
 ### 断言提前了，不会再白等 2.5 小时
 
-`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`、以及 `luci-app-socat`（来自 `package/`，非 feeds）、`airoha-en7581-npu-firmware` + `kmod-nft-offload`、`https-dns-proxy` + `luci-app-https-dns-proxy`、`luci-app-store`（iStore，来自 istore 源）。缺任何一个直接 `::error::` 终止，并打印 socat/iStore 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
+`build.yml` 现在在**配置阶段（10 分钟内）**就断言：设备符号、PON 4 件、`px5g-mbedtls`、`luci-app-ddns`、`openvpn-openssl` + `openvpn-easy-rsa` + `luci-app-openvpn-server`、以及 `luci-app-socat`（来自 `package/`，非 feeds）、`airoha-en7581-npu-firmware` + `kmod-nft-offload`、`https-dns-proxy` + `luci-app-https-dns-proxy`。缺任何一个直接 `::error::` 终止，并打印 socat 依赖的 `[OK]/[MISS]` 明细，方便一次定位。
 
 `luci-app-socat` 属"可选集成"，由 `build.yml` 顶部 `REQUIRE_OPTIONAL` 控制：
 - `'true'`（默认）：没生效就失败，快速暴露问题；
 - `'false'`：只告警、继续出固件。
-（`luci-app-store` / iStore 现已重新集成并参与配置阶段硬断言，源加载失败会在 10 分钟内红掉。）
+
+`luci-app-store`（iStore）属"软失败 / best-effort"，由 `build.yml` 顶部 `REQUIRE_ISTORE` 控制：
+- `'false'`（默认）：iStore **不会**阻断编译——源克隆失败或依赖不满足时只告警、继续出固件（NPU/DoH/温度等核心功能不受影响）；若成功加载则自动进包。
+- `'true'`：强制——iStore 没集成就 `::error::` 终止，用于定位必须修的根因。
+- 另外，Update feeds 阶段会对 istore 源**单独重试 3 次**，专门规避 GitHub 偶发限流导致的克隆失败（这是本次 `luci-app-store` 未生效的最可能原因）。若仍缺失，配置阶段日志的 `::group::iStore 集成诊断` 会打印「feed 缺失」还是「依赖未满足」，据此判断根因。
 
 ## 在线安装软件包（apk 源，无需重新编译）
 
@@ -120,7 +124,7 @@ apk search luci-app-ttyd | head
 - **来源**：`feeds.conf.default` 里的 `src-git istore https://github.com/istoreos/istore.git;main`（iStoreOS 官方源）。只需选 `luci-app-store`，它的 `LUCI_DEPENDS` 自动拉 `curl` / `tar` / `libuci-lua` / `mount-utils` / `luci-lib-taskd`；`luci-lib-taskd` 再拉 `luci-lib-xterm` + `taskd`（后端守护进程）。`luci-compat` 本配置已含（19.07+ 必需）。
 - **apk 支持**：该包 Makefile 含 `USE_APK`，对 apk 体系做了适配，可在本固件的 apk 上正常安装/卸载插件。
 - **编译注意**：构建时会从 GitHub 下载 `istore-ui` 前端 tarball（linkease/istore-ui），所以 `make download` 阶段需联网；若 download 失败会红在下载环节。
-- **配置阶段硬断言**：`build.yml` 现已把 `luci-app-store` 纳入配置阶段硬断言——istore 源没加载成功、或包被静默丢弃，会在 10 分钟内 `::error::` 终止（不再像以前那样「静默丢整包」）。
+- **集成策略（best-effort，不阻断编译）**：`build.yml` 对 istore 源做 Update feeds 单独重试 3 次；`luci-app-store` 默认**不**参与硬断言——源克隆失败或依赖未满足时只告警、继续出固件（NPU/DoH/温度等核心功能不受影响）。若你**必须**要 iStore，把 `build.yml` 顶部 `REQUIRE_ISTORE` 改成 `'true'` 即可让它在缺失时红掉。缺失时的根因会由日志里的 `::group::iStore 集成诊断` 输出（feed 缺失 / 依赖未满足）。
 - **刷机后验证**：LuCI **服务 → iStore** 可见；首次打开会拉取应用列表。若列表为空/打不开，通常是设备到 iStoreOS 软件源的联网问题，与编译无关。
 
 ## 本轮新增：NPU 硬件加速 + HTTPS DNS 代理（DoH）
