@@ -27,6 +27,9 @@ env:
   # socat 图形界面属"可选集成"：true=没生效就 fail（约 10 分钟内出结果，省得白跑 2.5h）；
   # 改成 false = 只告警、继续出固件。第三方 socat 源出问题时把它设为 false。
   REQUIRE_OPTIONAL: 'true'
+  # iStore 应用商店：true=没集成就 fail（强制调试）；false=没集成只告警、继续出固件
+  # （默认软失败，避免拖累 NPU/DoH/温度等核心功能；社区源偶发克隆失败不致命）。
+  REQUIRE_ISTORE: 'false'
 
 jobs:
   build:
@@ -103,9 +106,20 @@ jobs:
               *) continue ;;
             esac
             echo "--- 更新源: $name ---"
-            ./scripts/feeds update "$name" || echo "::warning::源 $name 更新失败，跳过"
+            ./scripts/feeds update "$name" ||             echo "::warning::源 $name 更新失败，跳过"
           done 3< feeds.conf.default
         fi
+
+        # iStore 源单独重试：GitHub 偶发限流/克隆失败会让 feeds/istore 为空、
+        # 导致 luci-app-store 符号整体缺失（配置阶段断言失败）。单独重试 3 次兜底。
+        for i in 1 2 3; do
+          if [ -f "feeds/istore/luci/luci-app-store/Makefile" ]; then
+            echo "  [ OK ] iStore 源已就位（检查 $i）"
+            break
+          fi
+          echo "::warning::iStore 源尚未就位，第 $i 次重试 feeds update istore"
+          ./scripts/feeds update istore || true
+        done
 
     - name: Install feeds
       run: |
@@ -182,8 +196,7 @@ jobs:
                  px5g-mbedtls luci-app-ddns \
                  openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server \
                  airoha-en7581-npu-firmware kmod-nft-offload \
-                 https-dns-proxy luci-app-https-dns-proxy \
-                 luci-app-store; do
+                 https-dns-proxy luci-app-https-dns-proxy; do
           if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
             echo "  [ OK ]   关键包 $p"
           else
@@ -212,6 +225,33 @@ jobs:
             fail=1
           else
             echo "::warning::第三方 package/ 包未生效:$OPT_MISS（继续编译）"
+          fi
+        fi
+
+        # ---------- 4) iStore 应用商店（社区源，软失败）----------
+        if grep -qE "^CONFIG_PACKAGE_luci-app-store=[ym]$" .config; then
+          echo "  [ OK ]   iStore: luci-app-store 已生效"
+        else
+          echo "::group::iStore 集成诊断"
+          if [ -f "feeds/istore/luci/luci-app-store/Makefile" ]; then
+            echo "  [feed OK] feeds/istore/luci/luci-app-store/Makefile 存在（源已加载）"
+            echo "  -> 符号被 defconfig 丢弃，通常是依赖未满足。检查关键依赖："
+            for d in curl tar libuci-lua mount-utils luci-lib-taskd luci-lib-xterm taskd luci-compat; do
+              if grep -qE "^CONFIG_PACKAGE_${d}=[ym]$" .config; then
+                echo "    [ OK ] $d"
+              else
+                echo "    [MISS] $d  <- 可能截断 iStore 依赖链"
+              fi
+            done
+          else
+            echo "  [feed 缺失] feeds/istore/luci/luci-app-store/Makefile 不存在（istore 源未成功加载/克隆失败）"
+          fi
+          echo "::endgroup::"
+          if [ "${REQUIRE_ISTORE}" = "true" ]; then
+            echo "::error::iStore luci-app-store 未生效（把 build.yml 里 REQUIRE_ISTORE 改成 false 可跳过）"
+            fail=1
+          else
+            echo "::warning::iStore luci-app-store 未生效，已跳过（不影响 NPU/DoH/温度等核心功能）"
           fi
         fi
 
