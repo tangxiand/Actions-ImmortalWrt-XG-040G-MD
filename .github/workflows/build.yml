@@ -24,12 +24,18 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   DEVICE_SYM: CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_nokia_xg-040g-md-ubi
-  # socat 图形界面属"可选集成"：true=没生效就 fail（约 10 分钟内出结果，省得白跑 2.5h）；
-  # 改成 false = 只告警、继续出固件。第三方 socat 源出问题时把它设为 false。
+  # 直接从 package/ 克隆的第三方 LuCI 应用（socat / airoha-npu / OpenVPN 客户端）属"可选集成"：
+  # true=没生效就 fail（约 10 分钟内出结果，省得白跑 2.5h）；
+  # 改成 false = 只告警、继续出固件。GitHub 克隆失败时把它设为 false。
   REQUIRE_OPTIONAL: 'true'
   # iStore 应用商店：true=没集成就 fail（强制调试）；false=没集成只告警、继续出固件
   # （默认软失败，避免拖累 NPU/DoH/温度等核心功能；社区源偶发克隆失败不致命）。
   REQUIRE_ISTORE: 'false'
+  # 工作流版本指纹：配置阶段会打印 BUILD_REV + my.config 的 sha256。
+  # 用途：2026-11-10 曾因仓库里 build.yml 未同步（旧版仍把 luci-app-ddns 列进关键包
+  # 硬断言），而 my.config 已关掉 DDNS，导致误报「关键包 luci-app-ddns 未生效」。
+  # 下次先看日志里的指纹，即可确认 CI 跑的是不是最新文件。
+  BUILD_REV: '2026-11-10b'
 
 jobs:
   build:
@@ -95,6 +101,25 @@ jobs:
         [ -f "$GITHUB_WORKSPACE/$DIY_P1_SH" ] && $GITHUB_WORKSPACE/$DIY_P1_SH || true
         [ -f "$GITHUB_WORKSPACE/$DIY_P2_SH" ] && $GITHUB_WORKSPACE/$DIY_P2_SH || true
 
+        # diy-part2.sh 调用时带了 || true 容错，这里显式校验产物，防止静默失效
+        for f in files/usr/lib/pon-tempinfo/tempinfo \
+                 files/etc/uci-defaults/97-pon-tempinfo \
+                 files/etc/uci-defaults/98-fix-apk-repos \
+                 files/etc/uci-defaults/99-npu-hw-offload; do
+          [ -f "$f" ] || { echo "::error::自定义文件缺失: $f（diy-part2.sh 可能执行失败）"; exit 1; }
+          sh -n "$f" || { echo "::error::自定义文件语法错误: $f"; exit 1; }
+        done
+        echo "OK: 4 个自定义 rootfs 文件校验通过"
+
+        # OpenVPN 客户端包从 openwrt/luci 稳定分支单独取，确认 include 已改成 buildroot 可用路径
+        if [ -f package/luci-app-openvpn/Makefile ]; then
+          if grep -q 'feeds/luci/luci.mk' package/luci-app-openvpn/Makefile; then
+            echo "OK: luci-app-openvpn 的 luci.mk include 已修正"
+          else
+            echo "::warning::luci-app-openvpn 的 luci.mk include 未修正（可能导致 defconfig 解析失败）"
+          fi
+        fi
+
     - name: Update feeds
       run: |
         cd openwrt
@@ -134,9 +159,9 @@ jobs:
             exit 1
           fi
         done
-        # socat 图形界面 / NPU 状态页由 diy-part1.sh 直接克隆进 package/（不走 feeds 索引），
-        # 这里确认它们真的就位，早发现早告警
-        for d in luci-app-socat luci-app-airoha-npu; do
+        # socat 图形界面 / NPU 状态页 / OpenVPN 客户端界面由 diy-part1.sh 直接克隆进 package/
+        # （不走 feeds 索引），这里确认它们真的就位，早发现早告警
+        for d in luci-app-socat luci-app-airoha-npu luci-app-openvpn; do
           if [ -f "package/$d/Makefile" ]; then
             echo "  [ OK ] package/$d/Makefile 已就位（diy-part1.sh 克隆成功）"
           else
@@ -155,6 +180,16 @@ jobs:
       run: |
         cd openwrt
 
+        # ---- 构建输入指纹：先确认 CI 跑的是不是最新文件 ----
+        # 2026-11-10 教训：GitHub 仓库里的 build.yml 未同步（旧版仍把 luci-app-ddns
+        # 列进关键包硬断言），而 my.config 已关掉 DDNS，于是必然误报
+        # 「关键包 luci-app-ddns 未生效」。比对下面两行即可一眼定位版本不同步。
+        echo "==================== 构建输入指纹 ===================="
+        echo "BUILD_REV        = ${BUILD_REV}"
+        echo "my.config sha256 = $(sha256sum "$GITHUB_WORKSPACE/$CONFIG_FILE" | cut -c1-16)"
+        echo "本版关键包断言   = 不含任何 DDNS / ddns-go 包"
+        echo "===================================================="
+
         cp -f "$BASE_CONFIG" .config
 
         sed -i -E 's|^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_(.+)=y$|# CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_\1 is not set|' .config
@@ -166,7 +201,9 @@ jobs:
             sym=""
             case "$line" in
               \#*)
-                sym=$(printf '%s' "$line" | sed -nE 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1/p')
+                # 包名普遍带连字符（ddns-go / luci-app-ddns / px5g-wolfssl …），
+                # 字符类必须含 '-'，否则 "is not set" 行会被整行跳过、基线里的 =y 删不掉。
+                sym=$(printf '%s' "$line" | sed -nE 's/^# (CONFIG_[A-Za-z0-9_-]+) is not set$/\1/p')
                 ;;
               *)
                 sym=${line%%=*}
@@ -192,8 +229,12 @@ jobs:
         fi
 
         # ---------- 2) 关键包（缺了固件就白编）----------
+        # 【DDNS 严禁加入本列表】DDNS / ddns-go 已于 2026-11-10 彻底移除。
+        # 旧版 workflow 把 luci-app-ddns 列在这里；一旦 my.config 关掉 DDNS，
+        # 就必然报「关键包 luci-app-ddns 未生效」并提前终止。看到该报错 =
+        # GitHub 仓库里的 build.yml 不是最新版，先同步文件，不要改配置去迁就它。
         for p in airoha-pond airoha-ponctl kmod-airoha-xpon kmod-airoha-en7572 \
-                 px5g-mbedtls luci-app-ddns \
+                 px5g-mbedtls jsonfilter \
                  openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server \
                  airoha-en7581-npu-firmware kmod-nft-offload \
                  https-dns-proxy luci-app-https-dns-proxy; do
@@ -205,14 +246,43 @@ jobs:
           fi
         done
 
-        # ---------- 3) socat 图形界面（第三方源，依赖 luci-compat 等）----------
+        # ---------- 2b) DDNS：按要求「不要了，直接注释掉」，整段停用 ----------
+        # 2026-11-10 用户明确「ddns 我可以不要，直接注释掉吧」。配置阶段对 DDNS
+        # 零断言、零告警、零诊断输出，杜绝旧文件混入时的误导性提示。
+        # 真正的「不要 DDNS」由 my.config 的 9 条 `# CONFIG_PACKAGE_* is not set` 实现：
+        #   它们是【取消开关】，长得像注释但不能删——删了基线 configs/an7581.config
+        #   里的同名 =y 行就会让 DDNS 重新进固件。
+        # 原检查代码（保留备查，已全部注释，不再执行）：
+        #   DDNS_LEFT=""
+        #   for p in ddns-go luci-app-ddns-go ddns-scripts luci-app-ddns; do
+        #     grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config && DDNS_LEFT="$DDNS_LEFT $p"
+        #   done
+        #   if [ -n "$DDNS_LEFT" ]; then
+        #     echo "::warning::DDNS 相关包仍被选中:$DDNS_LEFT"
+        #   else
+        #     echo "  [ OK ]   DDNS / DDNS-Go 已全部移除"
+        #   fi
+
+        # ---------- 2c) apk 软件源：4 个本地 feed 设为 m，编译期注释掉 404 源 ----------
+        # scripts/feeds 的 feed_config(): "Say M to add the feed commented out."
+        # include/feeds.mk 的 FeedSourcesAppendAPK: =m 时输出 "# %U/.../<feed>/packages.adb"
+        for f in pon_drivers pon_userspace istore video; do
+          if grep -qE "^CONFIG_FEED_${f}=m$" .config; then
+            echo "  [ OK ]   CONFIG_FEED_${f}=m（该源在 distfeeds.list 中被注释，不产生 404）"
+          else
+            echo "::warning::CONFIG_FEED_${f} 未生效为 m（首启 98-fix-apk-repos 仍会兜底清理）"
+          fi
+        done
+
+        # ---------- 3) socat 图形界面 / NPU 状态页 / OpenVPN 客户端（第三方 package/ 包）----------
         OPT_MISS=""
-        for p in luci-app-socat luci-app-airoha-npu; do
+        for p in luci-app-socat luci-app-airoha-npu luci-app-openvpn; do
           grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config || OPT_MISS="$OPT_MISS $p"
         done
         if [ -n "$OPT_MISS" ]; then
           echo "::group::第三方 package/ 包依赖诊断"
-          for p in luci-app-socat socat luci-compat luci-lua-runtime uhttpd-mod-lua luci-app-airoha-npu luci-base; do
+          for p in luci-app-socat socat luci-compat luci-lua-runtime uhttpd-mod-lua \
+                   luci-app-airoha-npu luci-base luci-app-openvpn openvpn-openssl; do
             if grep -qE "^CONFIG_PACKAGE_${p}=[ym]$" .config; then
               echo "  [ OK ] $p"
             else
@@ -221,7 +291,7 @@ jobs:
           done
           echo "::endgroup::"
             if [ "${REQUIRE_OPTIONAL}" = "true" ]; then
-            echo "::error::第三方 package/ 包未生效:$OPT_MISS（把 build.yml 里 REQUIRE_OPTIONAL 改成 false 可跳过；或检查 diy-part1.sh 是否成功克隆 luci-app-socat / luci-app-airoha-npu）"
+            echo "::error::第三方 package/ 包未生效:$OPT_MISS（把 build.yml 里 REQUIRE_OPTIONAL 改成 false 可跳过；或检查 diy-part1.sh 是否成功克隆 luci-app-socat / luci-app-airoha-npu / luci-app-openvpn）"
             fail=1
           else
             echo "::warning::第三方 package/ 包未生效:$OPT_MISS（继续编译）"
@@ -261,9 +331,9 @@ jobs:
         echo "==================== 功能解析情况 ===================="
         for p in luci-app-pon luci-i18n-pon-zh-cn airoha-pon-debug \
                  luci-app-iptv zerotier luci-app-zerotier luci-app-wol \
-                 ddns-go luci-app-ddns-go luci-app-ddns ddns-scripts \
                  socat luci-app-socat luci-app-airoha-npu luci-i18n-airoha-npu-zh-cn px5g-mbedtls \
-                 openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server kmod-tun \
+                 openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server \
+                 luci-app-openvpn luci-i18n-openvpn-zh-cn kmod-tun jsonfilter \
                  airoha-en7581-npu-firmware kmod-nft-offload \
                  https-dns-proxy luci-app-https-dns-proxy luci-app-store \
                  luci-theme-argon kmod-usb-storage kmod-fs-ext4 \
@@ -329,8 +399,8 @@ jobs:
           if [ -n "$M" ]; then
             echo "--- pon / airoha / fit 相关行 ---"
             grep -inE 'fitblk|fit-check|pon|airoha' "$M" || echo "(无匹配行)"
-            echo "--- ddns / socat / px5g / store / taskd 相关行 ---"
-            grep -inE 'ddns|socat|px5g|store|taskd|ca-bundle|ca-certificates' "$M" || echo "(无匹配行)"
+            echo "--- openvpn / socat / px5g / store / taskd 相关行 ---"
+            grep -inE 'openvpn|socat|px5g|store|taskd|ca-bundle|ca-certificates' "$M" || echo "(无匹配行)"
           fi
           echo
           echo "--- targets/packages 里 pon / fit 相关包 ---"
@@ -359,8 +429,9 @@ jobs:
 
         # 软校验：本次新增/确认的组件是否真进了镜像（只告警，不判失败）
         if [ -n "$M" ]; then
-          for p in px5g-mbedtls luci-app-ddns ddns-scripts socat \
-                   luci-app-socat luci-app-airoha-npu openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server kmod-tun \
+          for p in px5g-mbedtls jsonfilter socat \
+                   luci-app-socat luci-app-airoha-npu luci-app-openvpn \
+                   openvpn-openssl openvpn-easy-rsa luci-app-openvpn-server kmod-tun \
                    airoha-en7581-npu-firmware kmod-nft-offload \
                    https-dns-proxy luci-app-https-dns-proxy luci-app-store \
                    ca-bundle luci-app-package-manager; do
