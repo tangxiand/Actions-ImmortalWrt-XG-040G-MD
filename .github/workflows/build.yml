@@ -105,11 +105,21 @@ jobs:
         for f in files/usr/lib/pon-tempinfo/tempinfo \
                  files/etc/uci-defaults/97-pon-tempinfo \
                  files/etc/uci-defaults/98-fix-apk-repos \
-                 files/etc/uci-defaults/99-npu-hw-offload; do
+                 files/etc/uci-defaults/99-npu-hw-offload \
+                 files/usr/sbin/pon-watchdog \
+                 files/etc/init.d/pon-watchdog \
+                 files/etc/uci-defaults/96-pon-watchdog; do
           [ -f "$f" ] || { echo "::error::自定义文件缺失: $f（diy-part2.sh 可能执行失败）"; exit 1; }
           sh -n "$f" || { echo "::error::自定义文件语法错误: $f"; exit 1; }
         done
-        echo "OK: 4 个自定义 rootfs 文件校验通过"
+        # UCI 配置不是脚本，只校验存在；watchdog 主脚本额外校验关键判据与可执行位
+        [ -f files/etc/config/pon-watchdog ] || {
+          echo "::error::自定义文件缺失: files/etc/config/pon-watchdog"; exit 1; }
+        grep -q 'XG-PON MAC error' files/usr/sbin/pon-watchdog || {
+          echo "::error::pon-watchdog 内容异常（缺少 MAC error 判据）"; exit 1; }
+        [ -x files/usr/sbin/pon-watchdog ] && [ -x files/etc/init.d/pon-watchdog ] || {
+          echo "::error::pon-watchdog 缺少可执行位"; exit 1; }
+        echo "OK: 8 个自定义 rootfs 文件校验通过（含 pon-watchdog 三件套）"
 
         # OpenVPN 客户端包从 openwrt/luci 稳定分支单独取，确认 include 已改成 buildroot 可用路径
         if [ -f package/luci-app-openvpn/Makefile ]; then
