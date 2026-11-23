@@ -2,12 +2,24 @@
 
 本目录是**完整的 GitHub Actions 仓库内容**，commit 到你的 GitHub 仓库后，在 Actions 页面点一次 "Run workflow" 即可编译出带 PON 功能，并集成 socat 图形界面 / OpenVPN 服务端+客户端 / px5g-mbedtls / NPU 硬件加速 / DoH / 概览页 CPU+PON 温度的固件。DDNS 与 ddns-go 已按 2026-11-10 要求移除。
 
+## 2026-11-22 本轮变更：断网 / 无法拨号自动恢复（pon-watchdog）
+
+| 需求 | 处理 |
+|---|---|
+| 运行一段时间断网、PPPoE 无法重拨 | 新增 `pon-watchdog` 用户态守护：连续 3 轮（约 60s）检测到 WAN 无 IPv4 且 PON 仍 O5/有光 → 逐级恢复（重拨 → PON netdev down/up → `network restart`） |
+| 怀疑「PON MAC error」 | **已核实为上游已知缺陷** `pbs05/ponwrt` issue #49，非个例；详见下方专节 |
+| 其余功能 | NPU/DoH/温度/软件源/OpenVPN/socat/iStore 等**一律未改动**；本轮只加 `rootfs/` 下 4 个文件并同步 `diy-part2.sh`、`build.yml` |
+
+新增实体文件（`rootfs/`，既能编译进固件，也能直接 scp 到已刷机设备救急）：
+`usr/sbin/pon-watchdog`（主脚本）、`etc/init.d/pon-watchdog`（procd 守护）、`etc/config/pon-watchdog`（默认配置）、`etc/uci-defaults/96-pon-watchdog`（首启 enable+start）。
+`diy-part2.sh` 会把 `rootfs/` 原样复制进 `openwrt/files/`（并补可执行位），`build.yml` 在 Load custom feeds 步骤硬校验 **8 个**自定义文件。
+
 ## 2026-11-10 本轮变更
 
 | 需求 | 处理 |
 |---|---|
 | 加 OpenVPN **客户端** | 新增 `luci-app-openvpn` + `luci-i18n-openvpn-zh-cn`（从 `openwrt/luci@openwrt-24.10` 单独取包进 `package/`）；服务端 `luci-app-openvpn-server` 保留、两者不冲突 |
-| 取消「动态域名解析」和 `ddns-go` | `my.config` 用显式 `# CONFIG_PACKAGE_* is not set` 关掉 9 个符号（构建是「基线 + 差异项叠加」，只删 `=y` 行不够）；`build.yml` 配置阶段校验无残留 |
+| 取消「动态域名解析」和 `ddns-go` | `my.config` 用显式 `# CONFIG_PACKAGE_* is not set` 关掉 9 个符号（构建是「基线 + 差异项叠加」，只删 `=y` 行不够）；`build.yml` 的 DDNS 检查块已整段注释停用，关键包断言里也清除了 DDNS |
 | 显示 CPU / PON 温度 | **保持不变**：`diy-part2.sh` 注入的 `/sbin/tempinfo`（CPU 热区 + `ponctl status --json` 的 `frontend.temperature_celsius`）；本轮把 `jsonfilter` 加进配置阶段硬断言 |
 | 确保软件源可用 | **编译期主修**：`CONFIG_FEED_{pon_drivers,pon_userspace,istore,video}=m`，让 4 条 404 源在生成 `distfeeds.list` 时即被注释；首启 `98-fix-apk-repos` 继续兜底 |
 | 其他 | NPU 硬件加速、DoH、iStore（软失败）、socat、ZeroTier、WOL、主题等一律保持不变 |
@@ -19,7 +31,12 @@ your-repo/
 ├── .github/workflows/build.yml   # 编译工作流（PON 断言 + OpenVPN 服务端/客户端 + socat + NPU/DoH）
 ├── feeds.conf.default            # feeds 源：pon_drivers / pon_userspace / istore（socat 不再走此文件）
 ├── diy-part1.sh                  # 预处理脚本：克隆 luci-app-socat / luci-app-airoha-npu / luci-app-openvpn 进 package/
-├── diy-part2.sh                  # 注入自定义 rootfs 文件 + 首启脚本（温度 CPU+PON / apk 源清理 / NPU 卸载）
+├── diy-part2.sh                  # 注入自定义 rootfs 文件 + 首启脚本（温度 CPU+PON / apk 源清理 / NPU 卸载 / watchdog）
+├── rootfs/                       # 可直接部署到设备的实体文件（diy-part2.sh 复制进 openwrt/files/）
+│   ├── usr/sbin/pon-watchdog         # WAN 拨号失败自动重建 PON 链路
+│   ├── etc/init.d/pon-watchdog       # procd 守护（崩溃自动拉起）
+│   ├── etc/config/pon-watchdog       # 默认配置（开关 / 阈值 / 冷却 / 动作级别）
+│   └── etc/uci-defaults/96-pon-watchdog  # 首启 enable + start
 └── my.config                     # 功能差异项（device + PON + OpenVPN 服务端/客户端 + socat + NPU + DoH；DDNS 显式关闭）
 ```
 
@@ -40,6 +57,7 @@ your-repo/
 - `配置阶段断言全部通过` → **必须**出现（约 10 分钟内就能看到，不用等 2.5 小时）
 - `设备符号 ... 未生效` → **不能**出现（出现说明回落 EVB）
 - `关键包 ... 未生效` / `PON 组件未生效` → **不能**出现
+  - 特例：若报的是 `关键包 luci-app-ddns 未生效`，说明 GitHub 仓库里的 `build.yml` **不是最新版**（旧版把 DDNS 当关键包硬断言）。见下方「排错」节；**不要**去改 `my.config` 迁就旧断言。
 - `PON 核心组件校验通过` → 编译结束后**必须**出现
 
 可选功能解析情况里：
@@ -47,7 +65,7 @@ your-repo/
 - `[ OK ] luci-app-openvpn-server` → OpenVPN **服务端**界面
 - `[ OK ] luci-app-openvpn` → OpenVPN **客户端**界面（从 openwrt/luci 稳定分支单独取，见下方专节）
 - `[ OK ] px5g-mbedtls` / `[ OK ] jsonfilter` → 已进包
-- `DDNS / DDNS-Go 已全部移除` → 确认两套 DDNS 没被基线或依赖拉回
+- 配置阶段对 DDNS **零输出**（检查块已按 2026-11-10 要求整段注释停用；不再打印 `DDNS / DDNS-Go 已全部移除`）
 - 4 条 `[ OK ] CONFIG_FEED_*=m` → 404 源在编译期即被注释，软件源可用
 
 ## 产物位置
@@ -186,7 +204,38 @@ apk update
 - `my.config` 里 9 个符号全部改为显式 `# CONFIG_PACKAGE_xxx is not set`：`ddns-scripts{,-services,-cloudflare,-aliyun}`、`luci-app-ddns`、`luci-i18n-ddns-zh-cn`、`ddns-go`、`luci-app-ddns-go`、`luci-i18n-ddns-go-zh-cn`。
 - **为什么必须写成 `is not set`**：构建是「`configs/an7581.config` 基线 + `my.config` 差异项叠加」，`build.yml` 会把同名符号的 `=y` 行删掉再追加我方行；只删 `=y` 行的话，基线里若带同名符号仍会生效。`make defconfig` 也尊重 `is not set`。
 - **顺带修掉一个真 bug**：`build.yml` 原来用 `[A-Za-z0-9_]+` 从 `# CONFIG_XXX is not set` 里提取符号，**连字符不在字符类里**，于是所有带 `-` 的包名（`ddns-go`、`luci-app-ddns`，以及原有的 `px5g-wolfssl` / `px5g-openssl`）都被整行跳过、基线里的 `=y` 根本没被删掉。已改成 `[A-Za-z0-9_-]+`。模拟实测：9 条 DDNS 关闭行 + 2 条 px5g 关闭行都能正确覆盖基线 `=y`。
-- **校验**：`build.yml` 配置阶段会检查 `ddns-go / luci-app-ddns-go / ddns-scripts / luci-app-ddns` 是否仍为 `=y|m`，有残留则 `::warning::`（通常是被别的包依赖拉回），否则打印 `DDNS / DDNS-Go 已全部移除`。
+- **校验（2026-11-10 二次调整）**：按「ddns 可以不要，直接注释掉」的要求，`build.yml` 里 `2b` 段 DDNS 残留检查已**整段注释停用**，配置阶段对 DDNS 零断言、零告警、零输出；关键包硬断言列表里也严禁出现任何 DDNS 包。`my.config` 的 9 条 `is not set` 保留不变（它们是取消开关，不是残留）。
+
+### 排错：报错「关键包 `luci-app-ddns` 未生效」（2026-11-10）
+
+**现象**（一次 19 分钟的运行）：3 errors + 4 warnings，其中只有一条是根因：
+
+```
+::error::关键包 luci-app-ddns 未生效（符号不存在或依赖未满足）
+::error::配置阶段断言未通过，提前终止（省掉 2 小时空编译）
+Process completed with exit code 1.
+```
+
+**根因：GitHub 仓库里的 `build.yml` 与本地不同步。** 报错文案只可能来自配置阶段的「关键包硬断言」循环；而最新版 `build.yml` 的该循环里**没有** `luci-app-ddns`（上一轮已移除），只保留了「DDNS 已移除」的说明。旧版 workflow 仍把 `luci-app-ddns` 当关键包，而新版 `my.config` 已把它关掉 → defconfig 后该符号不存在 → 必然报"未生效"。**不是 DDNS 集成不了，也不是 `my.config` 写错。**
+
+**复核方法**（二选一）：
+1. 看日志开头的「构建输入指纹」：最新 workflow 会打印 `BUILD_REV = 2026-11-10b` 与 `my.config sha256`；旧版**没有这一行**。
+2. 在 GitHub 网页打开这次运行对应的 commit，查看 `.github/workflows/build.yml`，搜 `luci-app-ddns`——它只允许出现在注释里，**不能**出现在 `for p in ...` 的硬断言列表中。
+
+**修复**：把本地 `ponwrt-build/` 下这几个文件**全部** commit + push 到触发 workflow 的默认分支，再重新 Run workflow：
+
+```
+.github/workflows/build.yml   ← 本次报错就是漏同步它
+my.config
+diy-part1.sh
+diy-part2.sh
+feeds.conf.default
+README_build.md（可选）
+```
+
+**不要做**：① 删掉 `my.config` 里 9 条 `# CONFIG_PACKAGE_* is not set`（删了基线会把 DDNS 拉回来）；② 把 `luci-app-ddns` 加回硬断言去"迁就"旧 workflow。
+
+**那 4 条 warning 都不是新问题**：`没有产物目录 openwrt/bin/targets/airoha/an7581` 与两条 `No files were found with the provided path` 是配置阶段失败后 `if: always()` 的上传/整理步骤必然产生的次生警告；`iStore luci-app-store 未生效，已跳过` 是设计的软失败（`REQUIRE_ISTORE: 'false'`），符合"集成不了也没关系"，不影响 NPU/DoH/温度等核心功能。
 
 ### iStore 应用商店（服务 → iStore，包名 luci-app-store）
 
@@ -235,7 +284,90 @@ apk update
 
 本次 `my.config` 关键符号：`airoha-en7581-npu-firmware`、`kmod-nft-offload`、`luci-app-airoha-npu`、`luci-i18n-airoha-npu-zh-cn`、`https-dns-proxy`、`luci-app-https-dns-proxy`、`CONFIG_THERMAL` / `CONFIG_AIROHA_THERMAL`（CPU 热区，显式声明/冗余保护）、`jsonfilter`（tempinfo 解析 ponctl JSON）、`luci-app-store`（iStore，软失败）、`luci-app-openvpn` + `luci-i18n-openvpn-zh-cn`（OpenVPN 客户端）、`CONFIG_FEED_{pon_drivers,pon_userspace,istore,video}=m`（软件源编译期修复），以及 9 条 DDNS `is not set`。
 
-> 温度部分本轮**未改动**：`diy-part2.sh` 的 `tempinfo` / `97-pon-tempinfo` 与 `my.config` 的 `CONFIG_THERMAL` / `CONFIG_AIROHA_THERMAL` / `jsonfilter` 保持不变；`build.yml` 在 Load custom feeds 步骤硬校验 4 个自定义文件、在配置阶段硬断言 `jsonfilter`。刷机后 `/sbin/tempinfo` 应输出 `CPU: 59.1°C | PON: 41.5°C`。
+> 温度部分本轮**未改动**：`diy-part2.sh` 的 `tempinfo` / `97-pon-tempinfo` 与 `my.config` 的 `CONFIG_THERMAL` / `CONFIG_AIROHA_THERMAL` / `jsonfilter` 保持不变；`build.yml` 在 Load custom feeds 步骤硬校验 8 个自定义文件、在配置阶段硬断言 `jsonfilter`。刷机后 `/sbin/tempinfo` 应输出 `CPU: 59.1°C | PON: 41.5°C`。
+
+## 断网 / 无法拨号：XG-PON MAC error 与 pon-watchdog
+
+### 故障定性（有上游出处，不是猜测）
+
+`pbs05/ponwrt` **issue #49**：
+[XG-PON: MBI RX overruns wedge the MAC; only a MAC epoch reset recovers (AN7581: XG-040G-MD / ZN504XG-D)](https://github.com/pbs05/ponwrt/issues/49)
+
+| 项目 | issue #49 的记录 |
+|---|---|
+| 机型 | Nokia **XG-040G-MD**、ZN504XG-D（均 AN7581），内核 6.18，`airoha-xpon` 驱动，`xgpon` 模式 |
+| 触发 | **随机、与流量无关**，多在开机 36~46 小时后 |
+| 内核日志 | `airoha-xpon ...: XG-PON MAC error: int=0x00008000 fifo=0x00000180 tx=0x00000000 rx=0x00000000` |
+| 根因 | MBI **接收侧**溢出风暴卡死下行通路；`MBI_RX_STOP_DONE` 从不置位（`raw=0xc1018101`），软件无法自行排空 |
+| 现象 | `pppoe-wan` / `pppoe-iptv` 同时掉线，PPPoE 一直重拨但每次失败，**不会自愈** |
+| 恢复 | 未打补丁时靠手动 `/etc/init.d/network restart`（实测约 463s 死链 + 人工）；社区补丁在驱动内自动 MAC epoch reset，约 **17.6s** 自动恢复 |
+| 状态 | issue 仍是 **open**；补丁 `mbi-reset.patch` 以附件形式提供、未合并，作者明确说这是「缓解而非根因修复」 |
+
+先确诊再谈修复，SSH 里跑：
+```sh
+dmesg | grep 'XG-PON MAC error' | tail -20       # 有这些行即可确认是 issue #49
+/usr/sbin/ponctl status                           # 看 onu_state / optical_signal / service_ready
+logread | grep -iE 'pppoe|PADI|timeout' | tail -30
+```
+
+### 为什么用用户态脚本，而不是直接打驱动补丁
+
+- `ponctl` **没有** `reset` / `restart` 子命令（`airoha-ponctl/src/src/main.rs` 的 `print_help()` 只有 `list/status/control/identity/mode/data-path`）；
+- 驱动的 debugfs 全是 `DEFINE_SHOW_ATTRIBUTE` **只读**（`airoha-xpon-diagnostics.c`），sysfs 也没有复位接口（`airoha-xpon-control.c` 只暴露 `serial_number/registration_id/omci_msk/data_path/service_ready`）；
+- 因此要触发重建，只能走 **netdev 的 ndo_open/ndo_stop**：`pbs05/openwrt-pon-drivers` 的 `airoha-xpon-main.c` 把 `airoha_xpon_controller_start()/stop()` 注册为 `link_ops` 的 `.start/.stop`，stop 会 `deactivate_rx`、start 会重新 `prepare frontend + start_rx`，等价于一次完整 MAC 重建。这正是 `/etc/init.d/network restart` 能恢复的原因。
+- **驱动补丁未集成的理由**：issue 仍 open、补丁是未 review 的草稿、要改 `feeds/pon_drivers` 里的内核源码（有编译失败风险）。用户态脚本零内核改动、可随时关闭、可观测，已能覆盖「自动恢复」这个目标；补丁只是把恢复时间从约 1 分钟压到 17.6 秒。若以后要根治，再单独集成不迟。
+
+### 脚本判定与动作
+
+`rootfs/usr/sbin/pon-watchdog` 由 `/etc/init.d/pon-watchdog` 经 procd 常驻（单实例、崩溃自动拉起），默认每 20 秒检测一次：
+
+1. **WAN 判据**：`ubus call network.interface.wan status` 里 `up=true` + 有 `l3_device` + 该设备有 IPv4，三者缺一即判「未拨上」。
+2. **PON 判据**：`ponctl status` 的 `onu_state: O5` + `optical_signal: 1`（EPON 跳过 O5）。**光路断 / OLT 侧故障时不动作**，避免把「光纤断了」误判成 MAC 故障反复重启。
+3. **确证加速**：`dmesg` 出现**新增**的 `XG-PON MAC error` 时首轮即触发，并可绕过 PON 检查。
+4. **防抖/限流**：连续 3 轮（约 60s）才动作；开机 180s 宽限；两次动作间隔 ≥1800s；一小时最多 2 次；三级全失败只告警不循环。
+5. **三级恢复**：
+   - Step1 `ifdown/ifup wan` —— 重新拨号；
+   - Step2 `ip link set pon0 down/up` —— 触发 controller stop/start，重建 MAC；
+   - Step3 `/etc/init.d/network restart` —— issue #49 实测有效的兜底（**会短暂中断 LAN**）。
+
+默认配置项见 `rootfs/etc/config/pon-watchdog`。状态在 `/tmp/pon-watchdog.state`，日志同时进 syslog 和 `/tmp/pon-watchdog.log`（自动限制 64 KB）。
+
+### 刷机后 / 已刷设备立即部署
+
+新固件首启由 `96-pon-watchdog` 自动 enable + start，**无需任何界面设置**。手上这台设备不想等重编译，可直接部署同一份文件：
+
+```sh
+# 在本机（WinSCP / scp 均可），把 3 个文件传到设备
+scp rootfs/usr/sbin/pon-watchdog      root@192.168.3.1:/usr/sbin/pon-watchdog
+scp rootfs/etc/init.d/pon-watchdog    root@192.168.3.1:/etc/init.d/pon-watchdog
+scp rootfs/etc/config/pon-watchdog    root@192.168.3.1:/etc/config/pon-watchdog
+ssh root@192.168.3.1 'chmod 755 /usr/sbin/pon-watchdog /etc/init.d/pon-watchdog && /etc/init.d/pon-watchdog enable && /etc/init.d/pon-watchdog start'
+```
+
+**现在就断网、还没装脚本**时的手动恢复（等价于脚本的 Step2+Step3）：
+```sh
+ifdown wan; sleep 2; ip link set pon0 down; sleep 3; ip link set pon0 up; ifup wan
+# 仍不行再执行（issue #49 实测有效，会短暂断 LAN）：
+/etc/init.d/network restart
+```
+
+### 常用运维命令
+
+```sh
+/usr/sbin/pon-watchdog --check      # 只看判据与状态，不做任何动作
+/usr/sbin/pon-watchdog --once       # 单次检测（手动验证判定）
+/usr/sbin/pon-watchdog --recover    # 立即强制执行一次三级恢复
+logread | grep pon-watchdog         # 看恢复历史
+/etc/init.d/pon-watchdog restart    # 改完配置后重载
+# 临时停用：
+uci set pon-watchdog.main.enabled=0; uci commit pon-watchdog; /etc/init.d/pon-watchdog stop
+# 只想重拨、不想动 PON / 不想 network restart：
+uci set pon-watchdog.main.action_level=1; uci commit pon-watchdog; /etc/init.d/pon-watchdog restart
+# 光路不稳、仍希望强行恢复：
+uci set pon-watchdog.main.require_pon_ok=0; uci commit pon-watchdog; /etc/init.d/pon-watchdog restart
+```
+
+> 验证记录（2026-11-22）：9 个模拟场景实跑全通过——WAN 正常不动作；连续 3 轮才触发；次数上限生效；PON 非 O5/无光不误触发；新增 MAC error 首轮立即触发；Step2 / Step3 逐级升级；三级全失败只执行 1 次 `network restart` 不循环。所有脚本 `sh -n` 通过，`validate_build.py` 12 步全绿、问题数 0。
 
 ## 想让我以后直接帮你触发编译？
 

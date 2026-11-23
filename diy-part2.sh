@@ -9,10 +9,36 @@
 #   files/etc/uci-defaults/97-pon-tempinfo    首启安装 /sbin/tempinfo
 #   files/etc/uci-defaults/98-fix-apk-repos   首启剔除 404 的 apk 源
 #   files/etc/uci-defaults/99-npu-hw-offload  首启开启 NPU 硬件流卸载
+#   rootfs/ 下 4 个文件（原样复制进 files/）：
+#     usr/sbin/pon-watchdog                  WAN 拨号失败自动重建 PON 链路
+#     etc/init.d/pon-watchdog                procd 守护
+#     etc/config/pon-watchdog                默认配置
+#     etc/uci-defaults/96-pon-watchdog       首启启用
 
 set -e
 
 mkdir -p files/etc/uci-defaults files/usr/lib/pon-tempinfo
+
+# ===========================================================================
+# 0) 复制 rootfs/ 下的实体文件（watchdog 三件套 + 首启脚本）
+# ===========================================================================
+# 实体文件单独放 rootfs/ 的好处：同一份文件既能编译进固件，
+# 也能直接 scp 到已刷机的设备上救急，不需要重编译。
+# 调用时 cwd = openwrt/，故优先用 GITHUB_WORKSPACE 定位，本地测试回退到脚本同目录。
+ROOTFS_SRC=""
+for cand in "${GITHUB_WORKSPACE:-}/rootfs" "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/rootfs"; do
+	[ -d "$cand" ] && { ROOTFS_SRC="$cand"; break; }
+done
+if [ -n "$ROOTFS_SRC" ]; then
+	cp -a "$ROOTFS_SRC/." files/
+	chmod +x files/usr/sbin/pon-watchdog \
+	         files/etc/init.d/pon-watchdog \
+	         files/etc/uci-defaults/96-pon-watchdog
+	echo "OK: 已从 $ROOTFS_SRC 复制 watchdog 文件"
+else
+	echo "::error::找不到 rootfs/ 源目录（watchdog 文件无法注入）"
+	exit 1
+fi
 
 # ===========================================================================
 # 1) 概览页「温度」行：CPU + PON 光前端温度
@@ -151,9 +177,13 @@ exit 0
 UCI_EOF
 chmod +x files/etc/uci-defaults/99-npu-hw-offload
 
-echo "OK: diy-part2.sh 已写入 4 个自定义文件"
+echo "OK: diy-part2.sh 已写入 8 个自定义文件"
 echo "    - files/usr/lib/pon-tempinfo/tempinfo      (CPU + PON 温度)"
 echo "    - files/etc/uci-defaults/97-pon-tempinfo   (安装 /sbin/tempinfo)"
 echo "    - files/etc/uci-defaults/98-fix-apk-repos  (清理 404 的 apk 源)"
 echo "    - files/etc/uci-defaults/99-npu-hw-offload (开启 NPU 硬件卸载)"
+echo "    - files/usr/sbin/pon-watchdog              (WAN 拨号失败自动恢复)"
+echo "    - files/etc/init.d/pon-watchdog            (procd 守护)"
+echo "    - files/etc/config/pon-watchdog            (默认配置)"
+echo "    - files/etc/uci-defaults/96-pon-watchdog   (首启启用)"
 exit 0
