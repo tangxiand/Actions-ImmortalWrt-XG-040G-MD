@@ -1,0 +1,293 @@
+#!/bin/sh
+# pon-watchdog —— WAN(PPPoE) 无法拨号时自动重建 PON 链路
+#
+# ============================ 依据（可复核） ============================
+# 故障：pbs05/ponwrt issue #49
+#   https://github.com/pbs05/ponwrt/issues/49
+#   "XG-PON: MBI RX overruns wedge the MAC; only a MAC epoch reset recovers
+#    (AN7581: XG-040G-MD / ZN504XG-D)"
+#   - 内核日志：airoha-xpon ...: XG-PON MAC error: int=0x00008000
+#               fifo=0x00000180 tx=0x00000000 rx=0x00000000
+#   - MBI 接收侧溢出风暴把下行通路卡死，pppoe-wan / pppoe-iptv 同时掉线，
+#     PPPoE 一直重拨但每次失败，且【不会自愈】；随机发生在开机 36~46 小时后。
+#   - issue 实测：手动 `/etc/init.d/network restart` 可恢复（约 463s 死链 + 人工）。
+#   - 社区补丁（未合并，附件 mbi-reset.patch）在驱动内自动做 MAC epoch reset，
+#     恢复约 17.6s；issue 目前仍是 open 状态。
+#
+# 本脚本是【用户态兜底】，不改内核、不改驱动、不改 LuCI：
+#   连续 N 轮检测到 WAN 拿不到 IPv4，且 PON 仍 O5/有光 → 逐级恢复：
+#     Step1  ifdown/ifup wan                 重新拨号（最轻）
+#     Step2  ip link set ponX down/up       触发 airoha_xpon_controller_stop/start
+#            依据 pbs05/openwrt-pon-drivers@main
+#              airoha-xpon/src/airoha-xpon-main.c 的
+#              airoha_xpon_controller_stop()/start() 注册为 link_ops 的 .stop/.start，
+#              由 PON netdev 的 ndo_open/ndo_stop 调用；stop 会 deactivate_rx，
+#              start 会重新 prepare frontend + start_rx（即完整 MAC 重建）。
+#     Step3  /etc/init.d/network restart     issue #49 实测有效，最后兜底
+#            注意：会短暂中断 LAN。
+#
+# PON 设备名：pbs05/ponwrt@master
+#   target/linux/airoha/an7581/base-files/etc/board.d/02_network
+#   对 nokia,xg-040g-md-ubi 使用 ucidef_set_interfaces_lan_wan "... " "pon0"
+#   并注释 "netifd opens pon0 when the wan interface starts"。
+#   脚本用 `ponctl list` 自动发现，失败才回退 pon0。
+#
+# ponctl 无 reset/restart 子命令（airoha-ponctl/src/src/main.rs 的 print_help），
+# 驱动 debugfs 也全是 DEFINE_SHOW_ATTRIBUTE 只读、sysfs 无复位接口
+# （airoha-xpon-diagnostics.c / airoha-xpon-control.c），
+# 所以只能靠 netdev down/up 或 network restart 触发重建。
+#
+# ============================ 防误触发 ============================
+#   * PON 不在 O5 / 无光（光路、OLT、运营商侧故障）默认【不动作】
+#   * 连续 N 轮（默认 3×20s=60s）才动作；dmesg 出现新的 MAC error 可立即动作
+#   * 冷却期（默认 1800s）+ 每小时次数上限（默认 2 次）+ 开机宽限（默认 180s）
+#   * 三级恢复全失败只告警、不无限重启
+#
+# 用法：
+#   pon-watchdog --loop      常驻循环（由 /etc/init.d/pon-watchdog 经 procd 拉起）
+#   pon-watchdog --once      单次检测（cron / 手动测试）
+#   pon-watchdog --check     只打印当前判据，不做任何动作
+#   pon-watchdog --recover   立即强制执行一次恢复（人工验证）
+# ====================================================================
+
+# 状态/日志/命令路径支持环境变量覆盖，便于在不改动设备的前提下做故障模拟
+STATE=${PONWD_STATE:-/tmp/pon-watchdog.state}
+LOGFILE=${PONWD_LOG:-/tmp/pon-watchdog.log}
+TAG=pon-watchdog
+
+cfg() {
+	v="$(uci -q get "pon-watchdog.main.$1" 2>/dev/null)"
+	if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+}
+
+ENABLED=$(cfg enabled 1)
+WAN_IFACE=$(cfg wan_iface wan)
+CHECK_INTERVAL=$(cfg check_interval 20)
+FAIL_THRESHOLD=$(cfg fail_threshold 3)
+COOLDOWN=$(cfg cooldown 1800)
+MAX_PER_HOUR=$(cfg max_per_hour 2)
+GRACE=$(cfg grace_period 180)
+ACTION_LEVEL=$(cfg action_level 3)
+REQUIRE_PON_OK=$(cfg require_pon_ok 1)
+PON_DEV_OVERRIDE=$(cfg pon_device '')
+LOG_TO_FILE=$(cfg log_to_file 1)
+PONCTL=${PONCTL:-$(cfg ponctl_path /usr/sbin/ponctl)}
+NETWORK_INIT=${NETWORK_INIT:-/etc/init.d/network}
+
+log() {
+	logger -t "$TAG" "$*" 2>/dev/null
+	[ "$LOG_TO_FILE" = "1" ] || return 0
+	if [ -f "$LOGFILE" ]; then
+		sz="$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)"
+		case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+		if [ "$sz" -gt 65536 ]; then
+			tail -n 200 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv -f "$LOGFILE.tmp" "$LOGFILE"
+		fi
+	fi
+	printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/dev/null
+}
+
+# 状态文件：last_action hour_start hour_count last_mac fails
+read_state() {
+	LAST_ACTION=0; HOUR_START=0; HOUR_COUNT=0; LAST_MAC=0; FAILS=0
+	[ -f "$STATE" ] || return 0
+	read -r LAST_ACTION HOUR_START HOUR_COUNT LAST_MAC FAILS < "$STATE" 2>/dev/null || return 0
+	case "$LAST_ACTION" in ''|*[!0-9]*) LAST_ACTION=0 ;; esac
+	case "$HOUR_START"   in ''|*[!0-9]*) HOUR_START=0 ;; esac
+	case "$HOUR_COUNT"   in ''|*[!0-9]*) HOUR_COUNT=0 ;; esac
+	case "$LAST_MAC"     in ''|*[!0-9]*) LAST_MAC=0 ;; esac
+	case "$FAILS"        in ''|*[!0-9]*) FAILS=0 ;; esac
+}
+
+save_state() {
+	printf '%s %s %s %s %s\n' \
+		"$LAST_ACTION" "$HOUR_START" "$HOUR_COUNT" "$LAST_MAC" "$FAILS" \
+		> "$STATE" 2>/dev/null
+}
+
+# 找到 PON netdev：ponctl list 优先，其次 /sys/class/net/*/xpon，最后回退 pon0
+pon_dev() {
+	if [ -n "$PON_DEV_OVERRIDE" ]; then printf '%s' "$PON_DEV_OVERRIDE"; return 0; fi
+	if [ -x "$PONCTL" ]; then
+		d="$("$PONCTL" list 2>/dev/null | sed -n 's/^device=\([^[:space:]]*\).*/\1/p' | head -n 1)"
+		if [ -n "$d" ]; then printf '%s' "$d"; return 0; fi
+	fi
+	for p in /sys/class/net/*/xpon/serial_number; do
+		[ -f "$p" ] || continue
+		d="${p#/sys/class/net/}"
+		d="${d%%/*}"
+		printf '%s' "$d"
+		return 0
+	done
+	printf 'pon0'
+}
+
+# WAN 是否真正拨上：ubus up=true + 有 l3_device + 该设备有 IPv4
+wan_ok() {
+	st="$(ubus -t 3 call "network.interface.$WAN_IFACE" status 2>/dev/null)" || return 1
+	[ -n "$st" ] || return 1
+	printf '%s' "$st" | grep -q '"up":true' || return 1
+	d="$(printf '%s' "$st" | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+	[ -n "$d" ] || return 1
+	ip -4 addr show dev "$d" 2>/dev/null | grep -q 'inet ' || return 1
+	return 0
+}
+
+# PON 链路是否健康（human 输出：字段名来自 airoha-ponctl/src/src/netlink.rs）
+#   返回 0=健康(O5 + 有光，或 EPON)  1=未就绪  2=无法判断
+pon_link_ok() {
+	[ -x "$PONCTL" ] || return 2
+	d="$(pon_dev)"
+	st="$("$PONCTL" --device "$d" status 2>/dev/null)" || return 2
+	[ -n "$st" ] || return 2
+	printf '%s' "$st" | grep -q '^optical_signal: 1' || return 1
+	if printf '%s' "$st" | grep -q '^active_mode: .*epon'; then return 0; fi
+	printf '%s' "$st" | grep -q '^onu_state: O5' || return 1
+	return 0
+}
+
+# 内核 ring buffer 里的 MAC error 条数（printk_ratelimited 会限流，只作"新增"判据）
+mac_error_count() {
+	c="$(dmesg 2>/dev/null | grep -c 'XG-PON MAC error')"
+	case "$c" in ''|*[!0-9]*) c=0 ;; esac
+	printf '%s' "$c"
+}
+
+wait_wan() {
+	limit="$1"
+	i=0
+	while [ "$i" -lt "$limit" ]; do
+		wan_ok && return 0
+		sleep 5
+		i=$((i + 5))
+	done
+	return 1
+}
+
+do_recover() {
+	log ">>> 开始恢复：原因=$1 WAN=$WAN_IFACE PON=$(pon_dev) level=$ACTION_LEVEL"
+
+	log "Step1 重新拨号：ifdown/ifup $WAN_IFACE"
+	ifdown "$WAN_IFACE" >/dev/null 2>&1
+	sleep 2
+	ifup "$WAN_IFACE" >/dev/null 2>&1
+	if wait_wan 30; then log "<<< Step1 成功，WAN 已恢复"; return 0; fi
+	[ "$ACTION_LEVEL" -ge 2 ] || { log "<<< 未恢复（action_level=1 到此为止）"; return 1; }
+
+	d="$(pon_dev)"
+	log "Step2 重建 PON 链路：ip link set $d down/up（触发 controller stop/start）"
+	ip link set "$d" down >/dev/null 2>&1
+	sleep 3
+	ip link set "$d" up >/dev/null 2>&1
+	sleep 2
+	ifup "$WAN_IFACE" >/dev/null 2>&1
+	if wait_wan 90; then log "<<< Step2 成功，WAN 已恢复"; return 0; fi
+	[ "$ACTION_LEVEL" -ge 3 ] || { log "<<< 未恢复（action_level=2 到此为止）"; return 1; }
+
+	log "Step3 兜底：$NETWORK_INIT restart（issue #49 实测有效，会短暂中断 LAN）"
+	"$NETWORK_INIT" restart >/dev/null 2>&1
+	if wait_wan 120; then log "<<< Step3 成功，WAN 已恢复"; return 0; fi
+	log "<<< 三级恢复均未奏效，停止动作等待人工排查（logread | grep $TAG）"
+	return 1
+}
+
+check_once() {
+	read_state
+	now="$(date +%s)"
+	up="$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)"
+	case "$up" in ''|*[!0-9]*) up=999999 ;; esac
+
+	[ "$ENABLED" = "1" ] || return 0
+	[ "$up" -ge "$GRACE" ] || return 0
+
+	cur="$(mac_error_count)"
+	mac_new=0
+	[ "$cur" -gt "$LAST_MAC" ] && mac_new=1
+	LAST_MAC="$cur"          # ring buffer 滚动导致计数变小时，自动重设基准
+
+	if wan_ok; then
+		[ "$FAILS" -ne 0 ] && log "WAN 已恢复（此前连续失败 $FAILS 轮）"
+		FAILS=0
+		save_state
+		return 0
+	fi
+
+	FAILS=$((FAILS + 1))
+	log "WAN 无 IPv4（第 $FAILS/$FAIL_THRESHOLD 轮；内核 MAC error 累计 $cur，本轮新增=$mac_new）"
+
+	if [ "$FAILS" -lt "$FAIL_THRESHOLD" ] && [ "$mac_new" -eq 0 ]; then
+		save_state
+		return 0
+	fi
+
+	pon_link_ok
+	prc=$?
+	if [ "$REQUIRE_PON_OK" = "1" ] && [ "$prc" -eq 1 ] && [ "$mac_new" -eq 0 ]; then
+		log "PON 不在 O5 或无光：判定为光路/OLT 侧故障，跳过恢复（require_pon_ok=1）"
+		FAILS=0
+		save_state
+		return 0
+	fi
+
+	if [ $((now - HOUR_START)) -ge 3600 ]; then
+		HOUR_START="$now"
+		HOUR_COUNT=0
+	fi
+	if [ "$HOUR_COUNT" -ge "$MAX_PER_HOUR" ]; then
+		log "WARN 一小时内已执行 $HOUR_COUNT 次恢复，达到上限 $MAX_PER_HOUR，暂停动作"
+		FAILS=0
+		save_state
+		return 0
+	fi
+	if [ "$LAST_ACTION" -gt 0 ] && [ $((now - LAST_ACTION)) -lt "$COOLDOWN" ]; then
+		log "冷却期内（距上次 $((now - LAST_ACTION))s < ${COOLDOWN}s），跳过"
+		FAILS=0
+		save_state
+		return 0
+	fi
+
+	reason="连续 $FAILS 轮 WAN 无 IPv4"
+	[ "$mac_new" -eq 1 ] && reason="检测到新的 XG-PON MAC error（$reason）"
+	do_recover "$reason"
+
+	LAST_ACTION="$now"
+	HOUR_COUNT=$((HOUR_COUNT + 1))
+	FAILS=0
+	save_state
+	return 0
+}
+
+do_check() {
+	d="$(pon_dev)"
+	if wan_ok; then w=yes; else w=no; fi
+	pon_link_ok
+	p=$?
+	case "$p" in
+		0) ps='ok(O5/有光)' ;;
+		1) ps='not-ready(非 O5 或无光)' ;;
+		*) ps='unknown(ponctl 不可用)' ;;
+	esac
+	echo "enabled        = $ENABLED"
+	echo "wan_iface      = $WAN_IFACE"
+	echo "pon_device     = $d"
+	echo "wan_up_ipv4    = $w"
+	echo "pon_link       = $ps"
+	echo "mac_error_cnt  = $(mac_error_count)"
+	echo "uptime_s       = $(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+	echo "config         = interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD cooldown=${COOLDOWN}s max_per_hour=$MAX_PER_HOUR grace=${GRACE}s level=$ACTION_LEVEL require_pon_ok=$REQUIRE_PON_OK"
+	echo "state          = $(cat "$STATE" 2>/dev/null || echo '(none)')"
+}
+
+case "${1:-}" in
+	--loop)
+		log "pon-watchdog 启动：interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD cooldown=${COOLDOWN}s level=$ACTION_LEVEL require_pon_ok=$REQUIRE_PON_OK"
+		while :; do
+			check_once
+			sleep "$CHECK_INTERVAL"
+		done
+		;;
+	--once)    check_once ;;
+	--check)   do_check ;;
+	--recover) do_recover "手动触发 --recover" ;;
+	*)         echo "用法: pon-watchdog --loop|--once|--check|--recover"; exit 1 ;;
+esac

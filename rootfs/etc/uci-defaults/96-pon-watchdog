@@ -1,0 +1,38 @@
+#!/bin/sh
+# 首启启用 pon-watchdog（96 在 97/98/99 之前执行，互不依赖）
+# 说明：files/ 覆盖已把 /usr/sbin/pon-watchdog、/etc/init.d/pon-watchdog、
+#       /etc/config/pon-watchdog 放进 rootfs；这里只负责权限与开机自启。
+
+if [ ! -x /usr/sbin/pon-watchdog ] && [ ! -f /usr/sbin/pon-watchdog ]; then
+	logger -t pon-watchdog "WARN: /usr/sbin/pon-watchdog 缺失，watchdog 未启用"
+	exit 0
+fi
+[ -f /etc/init.d/pon-watchdog ] || {
+	logger -t pon-watchdog "WARN: /etc/init.d/pon-watchdog 缺失，watchdog 未启用"
+	exit 0
+}
+
+chmod 755 /usr/sbin/pon-watchdog /etc/init.d/pon-watchdog
+
+# 配置缺失时写一份最小默认（正常情况由 files/ 提供，这里仅兜底）
+if [ ! -f /etc/config/pon-watchdog ]; then
+	cat > /etc/config/pon-watchdog <<'CONF_EOF'
+config watchdog 'main'
+	option enabled '1'
+	option wan_iface 'wan'
+	option check_interval '20'
+	option fail_threshold '3'
+	option grace_period '180'
+	option cooldown '1800'
+	option max_per_hour '2'
+	option action_level '3'
+	option require_pon_ok '1'
+	option log_to_file '1'
+CONF_EOF
+	logger -t pon-watchdog " wrote default /etc/config/pon-watchdog"
+fi
+
+/etc/init.d/pon-watchdog enable
+/etc/init.d/pon-watchdog start
+logger -t pon-watchdog "uci-defaults: enabled and started (XG-PON MAC error auto recovery)"
+exit 0

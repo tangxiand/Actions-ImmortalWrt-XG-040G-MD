@@ -1,0 +1,31 @@
+# pon-watchdog 配置（/etc/config/pon-watchdog）
+# 改完执行：/etc/init.d/pon-watchdog restart
+# 临时停用：uci set pon-watchdog.main.enabled=0; uci commit pon-watchdog; /etc/init.d/pon-watchdog stop
+# 注意：UCI 只保证行首 # 注释，故下方所有说明均为整行注释，不写在 option 后面。
+#
+# enabled        总开关；0 = 常驻但不执行任何动作
+# wan_iface      UCI 里的 WAN 接口名
+# pon_device     留空 = 自动发现（ponctl list）；也可手填 pon0
+# ponctl_path    ponctl 可执行文件位置，正常无需修改
+# check_interval 每轮检测间隔（秒）
+# fail_threshold 连续多少轮 WAN 无 IPv4 才动作（默认 3×20 = 60 秒）
+# grace_period   开机宽限（秒），避免刚开机拨号未完成就误判
+# cooldown       两次恢复动作最小间隔（秒）
+# max_per_hour   一小时内最多恢复次数，防止反复重启
+# action_level   1=只重拨；2=再加 PON down/up；3=再加 network restart 兜底
+# require_pon_ok PON 非 O5 / 无光时不动作（排除光路、OLT 侧故障）
+# log_to_file    同时写 /tmp/pon-watchdog.log（syslog 始终写）
+
+config watchdog 'main'
+	option enabled '1'
+	option wan_iface 'wan'
+	option pon_device ''
+	option ponctl_path '/usr/sbin/ponctl'
+	option check_interval '20'
+	option fail_threshold '3'
+	option grace_period '180'
+	option cooldown '1800'
+	option max_per_hour '2'
+	option action_level '3'
+	option require_pon_ok '1'
+	option log_to_file '1'
